@@ -35,19 +35,20 @@ Chunk streaming (priority + hysteresis + LOD)
 
 ### Files
 
-| Script | Role |
+**Primary drop-in:** `Assets/Scripts/TerrainGenerator.cs` — full finished single script containing all systems below.
+
+| Type (inside the script) | Role |
 |--------|------|
-| `WorldSeed.cs` | Master seed + `GetSystemSeed` / `GetChunkSeed` / `GetPositionSeed` |
-| `TerrainNoise.cs` | Deterministic layered Perlin + biome terrain evaluation |
-| `BiomeDefinition.cs` | `Biome`, terrain/vegetation settings, `BiomeSample`, objects |
-| `BiomeSystem.cs` | Capitals, domain warp, blend weights, elevation gate |
-| `TerrainChunkData.cs` | Pure chunk data + lifecycle states |
-| `TerrainChunk.cs` | Scene wrapper (mesh/collider/objects) |
-| `TerrainGenerator.cs` | Orchestrator: streaming, LOD, mesh, API |
-| `VegetationSystem.cs` | Deterministic grass placement (matrices only) |
-| `VegetationRenderer.cs` | GPU instancing draw calls |
-| `TerrainDeterminismDebugger.cs` | Reload/verify fingerprint UI |
-| `TerrainBiomeBlend.shader` | Shared material biome blend |
+| `WorldSeed` | Master seed + `GetSystemSeed` / `GetChunkSeed` / `GetPositionSeed` |
+| `TerrainNoise` | Deterministic layered Perlin + biome terrain evaluation |
+| `Biome` / settings / `BiomeSample` | Biome definitions, terrain/vegetation, objects |
+| `BiomeSystem` | Capitals, domain warp, blend weights, elevation gate |
+| `TerrainChunkData` | Pure chunk data + lifecycle states |
+| `TerrainChunk` | Scene wrapper (mesh/collider/objects) |
+| `TerrainGenerator` | Orchestrator: streaming, LOD, mesh, API |
+| `VegetationSystem` | Deterministic grass placement (matrices only) |
+| `TerrainDeterminismDebugger` | Reload/verify fingerprint UI |
+| `TerrainBiomeBlend*.shader` | Shared material biome blend |
 
 ---
 
