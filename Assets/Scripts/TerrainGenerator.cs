@@ -1,0 +1,2670 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.Rendering;
+
+/// <summary>
+/// Valheim-style procedural terrain generator (full finished script).
+///
+/// Pipeline:
+/// Seed → Biome regions → Terrain sampling → Biome blending → Mesh → Vegetation → Chunk streaming
+///
+/// Vertex color packing (Custom/TerrainBiomeBlend*):
+///   R = primary biome weight
+///   G = secondary biome weight
+///   B = primary biome index / 32
+///   A = secondary biome index / 32
+/// UV2.x = tertiary weight, UV2.y = tertiary biome index / 32
+///
+/// Grass is GPU-instanced (never individual GameObjects).
+/// </summary>
+public class TerrainGenerator : MonoBehaviour
+{
+    private const float BiomeIndexNormalize = 32f;
+    private const float VegetationRefreshMoveThreshold = 4f;
+
+    #region Inspector
+
+    [Header("World")]
+    [SerializeField] private int chunkSize = 50;
+    [SerializeField] private float worldRadius = 2000f;
+    [SerializeField] private bool enforceWorldBoundary = true;
+
+    [Header("Seed")]
+    [Tooltip("Primary world seed. Same seed = same world layout.")]
+    [SerializeField] private int worldSeed = 12345;
+    [Tooltip("Optional string seed. If set, overrides worldSeed via a stable hash.")]
+    [SerializeField] private string seedString = "";
+    [SerializeField] private bool useSeedString;
+
+    [Header("Terrain")]
+    [SerializeField] private float heightScale = 20f;
+    [SerializeField] private AnimationCurve heightCurve = AnimationCurve.EaseInOut(0, 0, 1, 1);
+    [SerializeField] private float uvScale = 2f;
+    [SerializeField] private int renderResolution = 50;
+    [SerializeField] private int colliderResolution = 25;
+
+    [Header("Noise")]
+    [SerializeField] private TerrainNoiseSettings noiseSettings = new TerrainNoiseSettings();
+
+    [Header("Biomes")]
+    [SerializeField] private Biome[] biomes;
+    [SerializeField] private float capitalSpacing = 180f;
+    [Range(0f, 0.5f)]
+    [SerializeField] private float capitalJitter = 0.35f;
+    [SerializeField] private float borderWarpScale = 90f;
+    [SerializeField] private float borderWarpStrength = 28f;
+    [SerializeField] private float spawnBiomeRadius = 220f;
+
+    [Header("Biome Blending")]
+    [SerializeField] private float biomeBlendDistance = 48f;
+    [SerializeField] private Material terrainBlendMaterial;
+    [SerializeField] private bool colorByBiome = true;
+
+    [Header("Elevation Materials (Fallback)")]
+    [SerializeField] private Material grassMaterial;
+    [SerializeField] private Material dirtMaterial;
+    [SerializeField] private Material rockMaterial;
+    [SerializeField] private Material snowMaterial;
+    [SerializeField] private float grassHeight;
+    [SerializeField] private float dirtHeight = 5f;
+    [SerializeField] private float rockHeight = 10f;
+    [SerializeField] private float snowHeight = 17f;
+
+    [Header("Vegetation")]
+    [SerializeField] private float grassCellSize = 2f;
+    [SerializeField] private bool enableGrass = true;
+    [SerializeField] private bool createDefaultGrassIfMissing = true;
+
+    [Header("Objects")]
+    [SerializeField] private int maxObjectsPerChunk = 100;
+    [SerializeField] private float objectSpacing = 2f;
+    [Range(0f, 1f)]
+    [SerializeField] private float objectAttemptChance = 0.12f;
+
+    [Header("Chunk Streaming")]
+    [SerializeField] private Transform playerTransform;
+    [SerializeField] private float terrainLoadDistance = 200f;
+    [SerializeField] private float terrainUnloadDistance = 300f;
+    [SerializeField] private float vegetationLoadDistance = 120f;
+    [SerializeField] private float vegetationUnloadDistance = 160f;
+    [SerializeField] private float objectLoadDistance = 180f;
+    [SerializeField] private float objectUnloadDistance = 240f;
+
+    // Back-compat aliases (map from older field names in docs/migrated scenes).
+    [HideInInspector] [SerializeField] private float chunkLoadDistance;
+    [HideInInspector] [SerializeField] private float chunkUnloadDistance;
+
+    [Header("LOD")]
+    [SerializeField] private float lod0Distance = 120f;
+    [SerializeField] private float lod1Distance = 220f;
+
+    [Header("Performance")]
+    [SerializeField] private int maxChunkGenerationsPerFrame = 1;
+    [SerializeField] private int meshVertexBudgetPerFrame = 2500;
+    [SerializeField] private bool useCoroutineGeneration = true;
+
+    [Header("Debug")]
+    [SerializeField] private bool showDebugLogs;
+    [SerializeField] private bool showChunkBoundaries;
+    [SerializeField] private bool showBiomeBoundaries;
+    [SerializeField] private bool showBiomeBlendWeights;
+    [SerializeField] private bool showVegetationDensity;
+    [SerializeField] private bool showTerrainNormals;
+    [SerializeField] private bool enableDeterminismProbe;
+    [SerializeField] private Vector2Int determinismProbeChunk = Vector2Int.zero;
+
+    #endregion
+
+    private readonly WorldSeed seed = new WorldSeed();
+    private readonly Dictionary<Vector2Int, TerrainChunk> activeChunks = new Dictionary<Vector2Int, TerrainChunk>();
+    private readonly Dictionary<Vector2Int, TerrainChunkData> chunkDataMap = new Dictionary<Vector2Int, TerrainChunkData>();
+    private readonly HashSet<Vector2Int> pendingGenerate = new HashSet<Vector2Int>();
+    private readonly List<Vector2Int> sortedLoadList = new List<Vector2Int>(128);
+    private readonly List<VegetationInstance> grassScratch = new List<VegetationInstance>(1024);
+
+    private Vector3[] vertexBuffer;
+    private Vector2[] uvBuffer;
+    private Vector2[] uv2Buffer;
+    private Color[] colorBuffer;
+    private Vector3[] normalBuffer;
+    private int[] triangleBuffer;
+    private readonly Matrix4x4[] grassBatchBuffer = new Matrix4x4[1023];
+
+    private BiomeSystem biomeSystem;
+    private VegetationSystem vegetationSystem;
+    private GameObject chunksContainer;
+    private Material sharedTerrainMaterial;
+    private Mesh defaultGrassMesh;
+    private Material defaultGrassMaterial;
+    private MaterialPropertyBlock grassPropertyBlock;
+
+    private Vector2Int lastPlayerChunk = new Vector2Int(int.MinValue, int.MinValue);
+    private Vector3 lastVegetationPlayerPos = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+    private int groundLayerId;
+    private int generationTokenCounter = 1;
+    private int totalChunksGenerated;
+    private bool generationLoopRunning;
+    private string lastDeterminismReport = "";
+    private int lastDrawnGrassCount;
+
+    #region Unity Lifecycle
+
+    private void Awake()
+    {
+        // Migrate older serialized load distances if present.
+        if (chunkLoadDistance > 0f && Mathf.Approximately(terrainLoadDistance, 200f))
+            terrainLoadDistance = chunkLoadDistance;
+        if (chunkUnloadDistance > 0f && Mathf.Approximately(terrainUnloadDistance, 300f))
+            terrainUnloadDistance = chunkUnloadDistance;
+    }
+
+    private void Start()
+    {
+        seed.Configure(worldSeed, seedString, useSeedString);
+        seed.Resolve();
+
+        groundLayerId = LayerMask.NameToLayer("Ground");
+        if (groundLayerId == -1)
+        {
+            Debug.LogWarning("[TerrainGenerator] 'Ground' layer not found. Using Default layer.");
+            groundLayerId = 0;
+        }
+
+        if (playerTransform == null)
+        {
+            GameObject player = GameObject.FindGameObjectWithTag("Player");
+            playerTransform = player != null ? player.transform : null;
+            if (playerTransform == null)
+                Debug.LogError("[TerrainGenerator] Player not found. Assign playerTransform or tag a GameObject as 'Player'.");
+        }
+
+        chunksContainer = new GameObject("Terrain_Chunks");
+        chunksContainer.transform.SetParent(transform, false);
+
+        grassPropertyBlock = new MaterialPropertyBlock();
+
+        EnsureDefaultMaterials();
+        EnsureDefaultBiomes();
+        EnsureDefaultGrassPrototypes();
+
+        biomeSystem = new BiomeSystem(
+            seed, biomes, worldRadius, capitalSpacing, capitalJitter,
+            borderWarpScale, borderWarpStrength, spawnBiomeRadius, biomeBlendDistance);
+
+        vegetationSystem = new VegetationSystem(seed, grassCellSize);
+
+        sharedTerrainMaterial = terrainBlendMaterial != null
+            ? terrainBlendMaterial
+            : CreateFallbackTerrainMaterial();
+
+        if (showDebugLogs)
+        {
+            Debug.Log(
+                $"[TerrainGenerator] Seed={seed.ResolvedSeed} Capitals={biomeSystem.CapitalCount} Biomes={biomes?.Length ?? 0} WorldRadius={worldRadius}",
+                gameObject);
+        }
+
+        if (playerTransform != null)
+            RequestChunkUpdate(force: true);
+
+        if (useCoroutineGeneration && !generationLoopRunning)
+            StartCoroutine(ChunkGenerationLoop());
+    }
+
+    private void Update()
+    {
+        if (playerTransform == null)
+            return;
+
+        Vector2Int playerChunk = GetChunkCoordinates(playerTransform.position);
+        if (playerChunk != lastPlayerChunk)
+        {
+            lastPlayerChunk = playerChunk;
+            RequestChunkUpdate(force: false);
+        }
+
+        UpdateVegetationDistanceFade();
+        UpdateObjectStreaming();
+        DrawVegetation();
+
+        if (enableDeterminismProbe)
+            RefreshDeterminismProbe();
+    }
+
+    private void LateUpdate()
+    {
+        if (!useCoroutineGeneration && playerTransform != null)
+            ProcessPendingGenerationsSync();
+    }
+
+    private void OnDrawGizmosSelected()
+    {
+        if (!Application.isPlaying)
+            return;
+
+        if (showChunkBoundaries)
+        {
+            Gizmos.color = new Color(1f, 1f, 0f, 0.35f);
+            foreach (var kvp in activeChunks)
+            {
+                Vector3 center = new Vector3((kvp.Key.x + 0.5f) * chunkSize, 2f, (kvp.Key.y + 0.5f) * chunkSize);
+                Gizmos.DrawWireCube(center, new Vector3(chunkSize, 4f, chunkSize));
+            }
+        }
+
+        if (showBiomeBoundaries && biomeSystem != null)
+        {
+            IReadOnlyList<Vector2> capitals = biomeSystem.GetCapitalPositionsForDebug();
+            for (int i = 0; i < capitals.Count; i++)
+            {
+                Gizmos.color = biomeSystem.GetCapitalBiomeColor(i);
+                Gizmos.DrawSphere(new Vector3(capitals[i].x, 5f, capitals[i].y), 6f);
+            }
+        }
+
+        if (showTerrainNormals)
+        {
+            Gizmos.color = Color.cyan;
+            foreach (var kvp in chunkDataMap)
+            {
+                TerrainChunkData data = kvp.Value;
+                if (data?.Normals == null || data.State < TerrainChunkData.ChunkState.Generated)
+                    continue;
+
+                int step = Mathf.Max(1, data.Resolution / 8);
+                for (int z = 0; z <= data.Resolution; z += step)
+                {
+                    for (int x = 0; x <= data.Resolution; x += step)
+                    {
+                        int idx = z * (data.Resolution + 1) + x;
+                        float wx = kvp.Key.x * chunkSize + (x / (float)data.Resolution) * chunkSize;
+                        float wz = kvp.Key.y * chunkSize + (z / (float)data.Resolution) * chunkSize;
+                        Vector3 pos = new Vector3(wx, data.Heights[idx], wz);
+                        Gizmos.DrawLine(pos, pos + data.Normals[idx] * 2f);
+                    }
+                }
+            }
+        }
+
+        if (showBiomeBlendWeights)
+        {
+            foreach (var kvp in chunkDataMap)
+            {
+                TerrainChunkData data = kvp.Value;
+                if (data?.BiomeSamples == null)
+                    continue;
+
+                int step = Mathf.Max(1, data.Resolution / 6);
+                for (int z = 0; z <= data.Resolution; z += step)
+                {
+                    for (int x = 0; x <= data.Resolution; x += step)
+                    {
+                        BiomeSample s = data.GetBiomeSample(x, z);
+                        float wx = kvp.Key.x * chunkSize + (x / (float)data.Resolution) * chunkSize;
+                        float wz = kvp.Key.y * chunkSize + (z / (float)data.Resolution) * chunkSize;
+                        float h = data.GetHeight(x, z);
+                        Gizmos.color = new Color(s.primaryWeight, s.secondaryWeight, 0f, 1f);
+                        Gizmos.DrawCube(new Vector3(wx, h + 0.5f, wz), Vector3.one * 0.6f);
+                    }
+                }
+            }
+        }
+    }
+
+    private void OnGUI()
+    {
+        if (!enableDeterminismProbe || string.IsNullOrEmpty(lastDeterminismReport))
+            return;
+
+        GUI.Box(new Rect(12, 12, 440, 150), "Determinism Probe");
+        GUI.Label(new Rect(24, 36, 416, 120), lastDeterminismReport);
+    }
+
+    #endregion
+
+    #region Public API
+
+    public int GetResolvedSeed() => seed.ResolvedSeed;
+    public int GetActiveChunkCount() => activeChunks.Count;
+    public int GetTotalChunksGenerated() => totalChunksGenerated;
+    public string GetLastDeterminismReport() => lastDeterminismReport;
+    public int GetLastDrawnGrassCount() => lastDrawnGrassCount;
+
+    public BiomeSample GetBiomeSample(Vector3 worldPosition)
+    {
+        EnsureSystems();
+        return biomeSystem.SampleBiome(worldPosition.x, worldPosition.z);
+    }
+
+    public float GetTerrainHeight(Vector3 worldPosition)
+    {
+        EnsureSystems();
+        Vector2Int coord = GetChunkCoordinates(worldPosition);
+        if (chunkDataMap.TryGetValue(coord, out TerrainChunkData data) && data.Heights != null)
+        {
+            float localX = worldPosition.x - coord.x * chunkSize;
+            float localZ = worldPosition.z - coord.y * chunkSize;
+            return data.SampleHeightBilinear(localX, localZ);
+        }
+
+        return SampleTerrainHeight(worldPosition.x, worldPosition.z);
+    }
+
+    public TerrainChunkData GetChunkData(Vector2Int chunkCoordinate)
+    {
+        chunkDataMap.TryGetValue(chunkCoordinate, out TerrainChunkData data);
+        return data;
+    }
+
+    public bool IsChunkLoaded(Vector2Int coordinate) => activeChunks.ContainsKey(coordinate);
+
+    public Biome GetBiomeAtWorldPosition(Vector3 worldPosition) => GetBiomeSample(worldPosition).primaryBiome;
+
+    #endregion
+
+    #region Streaming
+
+    private void RequestChunkUpdate(bool force)
+    {
+        Vector3 playerPos = playerTransform.position;
+        Vector2Int playerChunk = GetChunkCoordinates(playerPos);
+        float loadDistSq = terrainLoadDistance * terrainLoadDistance;
+        float unloadDistSq = terrainUnloadDistance * terrainUnloadDistance;
+
+        int chunkLoadRadius = Mathf.CeilToInt(terrainLoadDistance / chunkSize);
+        sortedLoadList.Clear();
+
+        for (int x = -chunkLoadRadius; x <= chunkLoadRadius; x++)
+        {
+            for (int z = -chunkLoadRadius; z <= chunkLoadRadius; z++)
+            {
+                Vector2Int chunkCoord = playerChunk + new Vector2Int(x, z);
+                if (!IsChunkInsideWorld(chunkCoord))
+                    continue;
+
+                if (ChunkDistanceSq(playerChunk, chunkCoord) <= loadDistSq)
+                    sortedLoadList.Add(chunkCoord);
+            }
+        }
+
+        Vector2Int pc = playerChunk;
+        sortedLoadList.Sort((a, b) => ChunkDistanceSq(pc, a).CompareTo(ChunkDistanceSq(pc, b)));
+
+        for (int i = 0; i < sortedLoadList.Count; i++)
+        {
+            Vector2Int coord = sortedLoadList[i];
+            if (!activeChunks.ContainsKey(coord) && !pendingGenerate.Contains(coord))
+                pendingGenerate.Add(coord);
+        }
+
+        List<Vector2Int> toUnload = null;
+        foreach (var kvp in activeChunks)
+        {
+            if (ChunkDistanceSq(playerChunk, kvp.Key) > unloadDistSq)
+            {
+                if (toUnload == null)
+                    toUnload = new List<Vector2Int>(8);
+                toUnload.Add(kvp.Key);
+            }
+        }
+
+        if (toUnload != null)
+        {
+            for (int i = 0; i < toUnload.Count; i++)
+                UnloadChunk(toUnload[i]);
+        }
+
+        if (showDebugLogs && (force || toUnload != null))
+            Debug.Log($"[TerrainGenerator] Player chunk {playerChunk}. Active={activeChunks.Count} Pending={pendingGenerate.Count}", gameObject);
+    }
+
+    private float ChunkDistanceSq(Vector2Int a, Vector2Int b)
+    {
+        float dx = (a.x - b.x) * chunkSize;
+        float dz = (a.y - b.y) * chunkSize;
+        return dx * dx + dz * dz;
+    }
+
+    private bool IsChunkInsideWorld(Vector2Int chunkCoord)
+    {
+        if (!enforceWorldBoundary)
+            return true;
+
+        float cx = (chunkCoord.x + 0.5f) * chunkSize;
+        float cz = (chunkCoord.y + 0.5f) * chunkSize;
+        return (cx * cx + cz * cz) <= worldRadius * worldRadius;
+    }
+
+    private void UnloadChunk(Vector2Int coord)
+    {
+        pendingGenerate.Remove(coord);
+
+        if (chunkDataMap.TryGetValue(coord, out TerrainChunkData data))
+        {
+            data.Invalidate(++generationTokenCounter);
+            chunkDataMap.Remove(coord);
+        }
+
+        if (activeChunks.TryGetValue(coord, out TerrainChunk chunk))
+        {
+            if (showDebugLogs)
+                Debug.Log($"[TerrainGenerator] Unload chunk {coord}", gameObject);
+
+            Destroy(chunk.gameObject);
+            activeChunks.Remove(coord);
+        }
+    }
+
+    #endregion
+
+    #region Generation Pipeline
+
+    private IEnumerator ChunkGenerationLoop()
+    {
+        generationLoopRunning = true;
+        while (enabled)
+        {
+            int generated = 0;
+            while (generated < maxChunkGenerationsPerFrame && TryDequeueNearest(out Vector2Int coord))
+            {
+                yield return GenerateChunkStaged(coord);
+                generated++;
+            }
+
+            yield return null;
+        }
+
+        generationLoopRunning = false;
+    }
+
+    private void ProcessPendingGenerationsSync()
+    {
+        int generated = 0;
+        while (generated < maxChunkGenerationsPerFrame && TryDequeueNearest(out Vector2Int coord))
+        {
+            IEnumerator e = GenerateChunkStaged(coord);
+            while (e.MoveNext()) { }
+            generated++;
+        }
+    }
+
+    private bool TryDequeueNearest(out Vector2Int coord)
+    {
+        coord = default;
+        if (pendingGenerate.Count == 0 || playerTransform == null)
+            return false;
+
+        Vector2Int playerChunk = GetChunkCoordinates(playerTransform.position);
+        float best = float.MaxValue;
+        bool found = false;
+        Vector2Int bestCoord = default;
+
+        foreach (Vector2Int c in pendingGenerate)
+        {
+            float d = ChunkDistanceSq(playerChunk, c);
+            if (d < best)
+            {
+                best = d;
+                bestCoord = c;
+                found = true;
+            }
+        }
+
+        if (!found)
+            return false;
+
+        pendingGenerate.Remove(bestCoord);
+        coord = bestCoord;
+        return true;
+    }
+
+    private IEnumerator GenerateChunkStaged(Vector2Int chunkCoord)
+    {
+        if (activeChunks.ContainsKey(chunkCoord) || !IsChunkInsideWorld(chunkCoord))
+            yield break;
+
+        int token = ++generationTokenCounter;
+        int lod = GetLodLevel(chunkCoord);
+        int resolution = GetResolutionForLod(lod);
+
+        TerrainChunkData data = new TerrainChunkData(chunkCoord, chunkSize);
+        data.BeginGeneration(lod, resolution, token);
+        chunkDataMap[chunkCoord] = data;
+
+        yield return BuildChunkSamples(data, token);
+        if (!data.IsTokenValid(token) || !chunkDataMap.ContainsKey(chunkCoord))
+            yield break;
+
+        BuildNormals(data);
+        if (!data.IsTokenValid(token))
+            yield break;
+
+        yield return null;
+
+        GameObject chunkObject = new GameObject($"Chunk_{chunkCoord.x}_{chunkCoord.y}");
+        chunkObject.transform.SetParent(chunksContainer.transform, false);
+        chunkObject.transform.position = new Vector3(chunkCoord.x * chunkSize, 0f, chunkCoord.y * chunkSize);
+
+        TerrainChunk chunk = chunkObject.AddComponent<TerrainChunk>();
+        chunk.BindData(data);
+        chunk.EnsureHierarchy(groundLayerId);
+        chunk.ApplyRenderMesh(BuildRenderMesh(data), sharedTerrainMaterial);
+
+        yield return null;
+        if (!data.IsTokenValid(token) || !chunkDataMap.ContainsKey(chunkCoord))
+        {
+            Destroy(chunkObject);
+            yield break;
+        }
+
+        chunk.ApplyColliderMesh(BuildColliderMesh(data));
+
+        yield return null;
+        if (!data.IsTokenValid(token) || !chunkDataMap.ContainsKey(chunkCoord))
+        {
+            Destroy(chunkObject);
+            yield break;
+        }
+
+        float objectDistSq = objectLoadDistance * objectLoadDistance;
+        if (playerTransform != null && ChunkDistanceSq(GetChunkCoordinates(playerTransform.position), chunkCoord) <= objectDistSq)
+            SpawnImportantObjects(chunk, data);
+
+        float vegDistSq = vegetationLoadDistance * vegetationLoadDistance;
+        if (enableGrass && playerTransform != null &&
+            ChunkDistanceSq(GetChunkCoordinates(playerTransform.position), chunkCoord) <= vegDistSq)
+        {
+            Dictionary<int, List<Matrix4x4>> matrices = new Dictionary<int, List<Matrix4x4>>(16);
+            vegetationSystem.GenerateGrass(data, playerTransform.position, vegetationLoadDistance, grassScratch, matrices, biomes);
+            chunk.SetGrassMatrices(matrices);
+        }
+
+        data.MarkGenerated();
+        data.MarkVisible();
+        data.BuildFingerprint(seed.ResolvedSeed);
+
+        activeChunks[chunkCoord] = chunk;
+        totalChunksGenerated++;
+
+        if (showDebugLogs)
+            Debug.Log($"[TerrainGenerator] Generated chunk {chunkCoord} | {data.DeterminismFingerprint}", gameObject);
+    }
+
+    private IEnumerator BuildChunkSamples(TerrainChunkData data, int token)
+    {
+        int res = data.Resolution;
+        int vertCount = (res + 1) * (res + 1);
+        EnsureVertexCapacity(vertCount);
+
+        int processed = 0;
+        Vector2Int coord = data.Coordinate;
+        BiomeSample[] corners = biomeSystem.GetOrCreateChunkCornerSamples(coord, chunkSize);
+
+        for (int z = 0; z <= res; z++)
+        {
+            for (int x = 0; x <= res; x++)
+            {
+                if (!data.IsTokenValid(token))
+                    yield break;
+
+                float u = x / (float)res;
+                float v = z / (float)res;
+                float worldX = coord.x * chunkSize + u * chunkSize;
+                float worldZ = coord.y * chunkSize + v * chunkSize;
+
+                BiomeSample sample = biomeSystem.SampleBiomeBilinear(corners, u, v);
+                if (sample.secondaryWeight > 0.05f || sample.primaryWeight < 0.92f)
+                    sample = biomeSystem.SampleBiome(worldX, worldZ);
+
+                float prelimHeight = SampleTerrainHeight(worldX, worldZ);
+                float normalizedDistance = Mathf.Clamp01(Mathf.Sqrt(worldX * worldX + worldZ * worldZ) / worldRadius);
+                sample = biomeSystem.ApplyElevationGate(sample, prelimHeight, normalizedDistance);
+
+                float height = EvaluateBlendedTerrainHeight(sample, worldX, worldZ);
+                int idx = z * (res + 1) + x;
+                data.Heights[idx] = height;
+                data.BiomeSamples[idx] = sample;
+                data.VertexColors[idx] = PackBiomeVertexColor(sample);
+
+                processed++;
+                if (processed >= meshVertexBudgetPerFrame)
+                {
+                    processed = 0;
+                    yield return null;
+                }
+            }
+        }
+    }
+
+    private float EvaluateBlendedTerrainHeight(BiomeSample sample, float worldX, float worldZ)
+    {
+        float h = 0f;
+        float w = 0f;
+
+        if (sample.primaryBiome != null)
+        {
+            h += TerrainNoise.EvaluateBiomeTerrain(seed, sample.primaryBiome.terrain, noiseSettings, worldX, worldZ) * sample.primaryWeight;
+            w += sample.primaryWeight;
+        }
+
+        if (sample.secondaryBiome != null && sample.secondaryWeight > 0f)
+        {
+            h += TerrainNoise.EvaluateBiomeTerrain(seed, sample.secondaryBiome.terrain, noiseSettings, worldX, worldZ) * sample.secondaryWeight;
+            w += sample.secondaryWeight;
+        }
+
+        if (sample.tertiaryBiome != null && sample.tertiaryWeight > 0f)
+        {
+            h += TerrainNoise.EvaluateBiomeTerrain(seed, sample.tertiaryBiome.terrain, noiseSettings, worldX, worldZ) * sample.tertiaryWeight;
+            w += sample.tertiaryWeight;
+        }
+
+        if (w <= 0.0001f)
+        {
+            float n = TerrainNoise.SampleLayeredBase(seed, noiseSettings, worldX, worldZ);
+            return heightCurve.Evaluate(n) * heightScale;
+        }
+
+        return h / w;
+    }
+
+    private float SampleTerrainHeight(float worldX, float worldZ)
+    {
+        BiomeSample sample = biomeSystem.SampleBiome(worldX, worldZ);
+        return EvaluateBlendedTerrainHeight(sample, worldX, worldZ);
+    }
+
+    private void BuildNormals(TerrainChunkData data)
+    {
+        int res = data.Resolution;
+        float step = chunkSize / (float)res;
+
+        for (int z = 0; z <= res; z++)
+        {
+            for (int x = 0; x <= res; x++)
+            {
+                int idx = z * (res + 1) + x;
+                float hL = data.GetHeight(Mathf.Max(0, x - 1), z);
+                float hR = data.GetHeight(Mathf.Min(res, x + 1), z);
+                float hD = data.GetHeight(x, Mathf.Max(0, z - 1));
+                float hU = data.GetHeight(x, Mathf.Min(res, z + 1));
+                data.Normals[idx] = new Vector3(hL - hR, step * 2f, hD - hU).normalized;
+            }
+        }
+    }
+
+    private Mesh BuildRenderMesh(TerrainChunkData data)
+    {
+        int res = data.Resolution;
+        int vertsPerSide = res + 1;
+        int vertCount = vertsPerSide * vertsPerSide;
+        EnsureVertexCapacity(vertCount);
+        EnsureTriangleCapacity(res * res * 6);
+
+        Vector2Int coord = data.Coordinate;
+
+        for (int z = 0; z <= res; z++)
+        {
+            for (int x = 0; x <= res; x++)
+            {
+                int idx = z * vertsPerSide + x;
+                float u = x / (float)res;
+                float v = z / (float)res;
+                BiomeSample sample = data.BiomeSamples[idx];
+
+                vertexBuffer[idx] = new Vector3(u * chunkSize, data.Heights[idx], v * chunkSize);
+                uvBuffer[idx] = new Vector2(u * uvScale, v * uvScale);
+                colorBuffer[idx] = data.VertexColors[idx];
+                normalBuffer[idx] = data.Normals[idx];
+
+                float tertiaryIndex = sample.tertiaryBiome != null
+                    ? (sample.tertiaryBiome.runtimeIndex + 0.5f) / BiomeIndexNormalize
+                    : 0f;
+                uv2Buffer[idx] = new Vector2(sample.tertiaryWeight, tertiaryIndex);
+            }
+        }
+
+        int t = 0;
+        for (int z = 0; z < res; z++)
+        {
+            for (int x = 0; x < res; x++)
+            {
+                int topLeft = z * vertsPerSide + x;
+                int topRight = topLeft + 1;
+                int bottomLeft = (z + 1) * vertsPerSide + x;
+                int bottomRight = bottomLeft + 1;
+
+                triangleBuffer[t++] = topLeft;
+                triangleBuffer[t++] = bottomLeft;
+                triangleBuffer[t++] = topRight;
+                triangleBuffer[t++] = topRight;
+                triangleBuffer[t++] = bottomLeft;
+                triangleBuffer[t++] = bottomRight;
+            }
+        }
+
+        Mesh mesh = new Mesh { name = $"Ground_{coord.x}_{coord.y}" };
+        if (vertCount > 65535)
+            mesh.indexFormat = IndexFormat.UInt32;
+
+        mesh.SetVertices(vertexBuffer, 0, vertCount);
+        mesh.SetNormals(normalBuffer, 0, vertCount);
+        mesh.SetColors(colorBuffer, 0, vertCount);
+        mesh.SetUVs(0, uvBuffer, 0, vertCount);
+        mesh.SetUVs(1, uv2Buffer, 0, vertCount);
+        mesh.SetTriangles(triangleBuffer, 0, t, 0, true);
+        mesh.RecalculateBounds();
+        return mesh;
+    }
+
+    private Mesh BuildColliderMesh(TerrainChunkData data)
+    {
+        int colRes = Mathf.Clamp(colliderResolution, 2, data.Resolution);
+        int vertsPerSide = colRes + 1;
+        Vector3[] verts = new Vector3[vertsPerSide * vertsPerSide];
+        int[] tris = new int[colRes * colRes * 6];
+
+        for (int z = 0; z <= colRes; z++)
+        {
+            for (int x = 0; x <= colRes; x++)
+            {
+                float u = x / (float)colRes;
+                float v = z / (float)colRes;
+                float localX = u * chunkSize;
+                float localZ = v * chunkSize;
+                verts[z * vertsPerSide + x] = new Vector3(localX, data.SampleHeightBilinear(localX, localZ), localZ);
+            }
+        }
+
+        int t = 0;
+        for (int z = 0; z < colRes; z++)
+        {
+            for (int x = 0; x < colRes; x++)
+            {
+                int topLeft = z * vertsPerSide + x;
+                int topRight = topLeft + 1;
+                int bottomLeft = (z + 1) * vertsPerSide + x;
+                int bottomRight = bottomLeft + 1;
+                tris[t++] = topLeft;
+                tris[t++] = bottomLeft;
+                tris[t++] = topRight;
+                tris[t++] = topRight;
+                tris[t++] = bottomLeft;
+                tris[t++] = bottomRight;
+            }
+        }
+
+        Mesh mesh = new Mesh { name = $"Collider_{data.Coordinate.x}_{data.Coordinate.y}" };
+        if (verts.Length > 65535)
+            mesh.indexFormat = IndexFormat.UInt32;
+        mesh.vertices = verts;
+        mesh.triangles = tris;
+        mesh.RecalculateBounds();
+        return mesh;
+    }
+
+    private static Color PackBiomeVertexColor(BiomeSample sample)
+    {
+        float primaryIndex = sample.primaryBiome != null
+            ? (sample.primaryBiome.runtimeIndex + 0.5f) / BiomeIndexNormalize
+            : 0f;
+        float secondaryIndex = sample.secondaryBiome != null
+            ? (sample.secondaryBiome.runtimeIndex + 0.5f) / BiomeIndexNormalize
+            : 0f;
+
+        return new Color(
+            Mathf.Clamp01(sample.primaryWeight),
+            Mathf.Clamp01(sample.secondaryWeight),
+            Mathf.Clamp01(primaryIndex),
+            Mathf.Clamp01(secondaryIndex));
+    }
+
+    #endregion
+
+    #region Objects
+
+    private void SpawnImportantObjects(TerrainChunk chunk, TerrainChunkData data)
+    {
+        Vector2Int coord = data.Coordinate;
+        System.Random rng = seed.CreateChunkRandom(coord, WorldSeed.SystemObjects);
+        int stride = Mathf.Max(1, Mathf.RoundToInt(Mathf.Max(objectSpacing, 1f)));
+        int spawned = 0;
+
+        for (int x = 0; x < chunkSize && spawned < maxObjectsPerChunk; x += stride)
+        {
+            for (int z = 0; z < chunkSize && spawned < maxObjectsPerChunk; z += stride)
+            {
+                if (rng.NextDouble() > objectAttemptChance)
+                    continue;
+
+                float localX = x + (float)rng.NextDouble() * stride;
+                float localZ = z + (float)rng.NextDouble() * stride;
+                if (localX > chunkSize || localZ > chunkSize)
+                    continue;
+
+                float height = data.SampleHeightBilinear(localX, localZ);
+                Vector3 normal = data.SampleNormalBilinear(localX, localZ);
+                float slope = Vector3.Angle(normal, Vector3.up);
+                BiomeSample sample = SampleBiomeFromData(data, localX, localZ);
+                Biome biome = sample.primaryBiome;
+                if (biome?.objects == null)
+                    continue;
+
+                for (int i = 0; i < biome.objects.Length; i++)
+                {
+                    BiomeObject obj = biome.objects[i];
+                    if (obj?.prefab == null || obj.category == BiomeObject.ObjectCategory.Decorative)
+                        continue;
+                    if (rng.NextDouble() > obj.spawnChance)
+                        continue;
+                    if (height < obj.minElevation || height > obj.maxElevation || slope > obj.maxSlope)
+                        continue;
+
+                    float scatter = Mathf.Max(0.1f, obj.minimumDistance > 0f ? obj.minimumDistance : objectSpacing);
+                    float worldX = coord.x * chunkSize + localX + ((float)rng.NextDouble() * 2f - 1f) * scatter * 0.35f;
+                    float worldZ = coord.y * chunkSize + localZ + ((float)rng.NextDouble() * 2f - 1f) * scatter * 0.35f;
+                    float y = data.SampleHeightBilinear(worldX - coord.x * chunkSize, worldZ - coord.y * chunkSize);
+
+                    float xRot = Mathf.Lerp(obj.minXRotation, obj.maxXRotation, (float)rng.NextDouble());
+                    float yRot = Mathf.Lerp(obj.minYRotation, obj.maxYRotation, (float)rng.NextDouble());
+
+                    GameObject instance = Instantiate(obj.prefab, new Vector3(worldX, y, worldZ), Quaternion.Euler(xRot, yRot, 0f), chunk.ObjectsRoot);
+                    PositionObjectOnTerrain(instance, y, obj.yOffset);
+                    instance.name = $"{obj.prefab.name}_{coord.x}_{coord.y}_{spawned}";
+                    chunk.RegisterSpawnedObject(instance);
+                    spawned++;
+                    break;
+                }
+            }
+        }
+
+        data.ObjectInstanceCount = spawned;
+    }
+
+    private void UpdateObjectStreaming()
+    {
+        if (playerTransform == null)
+            return;
+
+        Vector2Int playerChunk = GetChunkCoordinates(playerTransform.position);
+        float loadSq = objectLoadDistance * objectLoadDistance;
+        float unloadSq = objectUnloadDistance * objectUnloadDistance;
+
+        foreach (var kvp in activeChunks)
+        {
+            TerrainChunk chunk = kvp.Value;
+            if (chunk?.Data == null || chunk.Data.State < TerrainChunkData.ChunkState.Generated)
+                continue;
+
+            float distSq = ChunkDistanceSq(playerChunk, kvp.Key);
+            bool hasObjects = chunk.SpawnedObjects != null && chunk.SpawnedObjects.Count > 0;
+
+            if (distSq > unloadSq && hasObjects)
+            {
+                chunk.ClearSpawnedObjects();
+                chunk.Data.ObjectInstanceCount = 0;
+            }
+            else if (distSq <= loadSq && !hasObjects)
+            {
+                SpawnImportantObjects(chunk, chunk.Data);
+                chunk.Data.BuildFingerprint(seed.ResolvedSeed);
+            }
+        }
+    }
+
+    private static BiomeSample SampleBiomeFromData(TerrainChunkData data, float localX, float localZ)
+    {
+        float u = localX / data.ChunkSize * data.Resolution;
+        float v = localZ / data.ChunkSize * data.Resolution;
+        int x = Mathf.Clamp(Mathf.RoundToInt(u), 0, data.Resolution);
+        int z = Mathf.Clamp(Mathf.RoundToInt(v), 0, data.Resolution);
+        return data.GetBiomeSample(x, z);
+    }
+
+    private void PositionObjectOnTerrain(GameObject objectInstance, float terrainElevation, float yOffset = 0f)
+    {
+        Collider[] colliders = objectInstance.GetComponentsInChildren<Collider>();
+        if (colliders.Length > 0)
+        {
+            Bounds bounds = colliders[0].bounds;
+            for (int i = 1; i < colliders.Length; i++)
+                bounds.Encapsulate(colliders[i].bounds);
+            SetY(objectInstance, terrainElevation + bounds.extents.y + yOffset);
+            return;
+        }
+
+        Renderer[] renderers = objectInstance.GetComponentsInChildren<Renderer>();
+        if (renderers.Length > 0)
+        {
+            Bounds bounds = renderers[0].bounds;
+            for (int i = 1; i < renderers.Length; i++)
+                bounds.Encapsulate(renderers[i].bounds);
+            SetY(objectInstance, terrainElevation + bounds.extents.y + yOffset);
+            return;
+        }
+
+        SetY(objectInstance, terrainElevation + yOffset);
+    }
+
+    private static void SetY(GameObject go, float y)
+    {
+        Vector3 p = go.transform.position;
+        p.y = y;
+        go.transform.position = p;
+    }
+
+    #endregion
+
+    #region Vegetation
+
+    private void UpdateVegetationDistanceFade()
+    {
+        if (!enableGrass || playerTransform == null || vegetationSystem == null)
+            return;
+
+        Vector3 playerPos = playerTransform.position;
+        if ((playerPos - lastVegetationPlayerPos).sqrMagnitude < VegetationRefreshMoveThreshold * VegetationRefreshMoveThreshold)
+            return;
+
+        lastVegetationPlayerPos = playerPos;
+        Vector2Int playerChunk = GetChunkCoordinates(playerPos);
+        float vegLoadSq = vegetationLoadDistance * vegetationLoadDistance;
+        float vegUnloadSq = vegetationUnloadDistance * vegetationUnloadDistance;
+
+        foreach (var kvp in activeChunks)
+        {
+            TerrainChunk chunk = kvp.Value;
+            if (chunk?.Data == null)
+                continue;
+
+            float distSq = ChunkDistanceSq(playerChunk, kvp.Key);
+            if (distSq > vegUnloadSq)
+            {
+                chunk.ClearGrassMatrices();
+                continue;
+            }
+
+            if (distSq <= vegLoadSq)
+            {
+                Dictionary<int, List<Matrix4x4>> matrices = new Dictionary<int, List<Matrix4x4>>(16);
+                vegetationSystem.GenerateGrass(chunk.Data, playerPos, vegetationLoadDistance, grassScratch, matrices, biomes);
+                chunk.SetGrassMatrices(matrices);
+
+                if (showVegetationDensity && showDebugLogs)
+                    Debug.Log($"[Vegetation] Chunk {kvp.Key} instances={chunk.Data.GrassInstanceCount}", gameObject);
+            }
+        }
+    }
+
+    private void DrawVegetation()
+    {
+        lastDrawnGrassCount = 0;
+        if (!enableGrass)
+            return;
+
+        foreach (var kvp in activeChunks)
+        {
+            Dictionary<int, List<Matrix4x4>> matrices = kvp.Value != null ? kvp.Value.GrassMatrices : null;
+            if (matrices == null)
+                continue;
+
+            foreach (var entry in matrices)
+            {
+                VegetationSystem.UnpackGrassKey(entry.Key, out int biomeIndex, out int grassTypeIndex);
+                if (biomes == null || biomeIndex < 0 || biomeIndex >= biomes.Length)
+                    continue;
+
+                Biome biome = biomes[biomeIndex];
+                if (biome?.vegetation?.grassTypes == null)
+                    continue;
+                if (grassTypeIndex < 0 || grassTypeIndex >= biome.vegetation.grassTypes.Length)
+                    continue;
+
+                GrassType grass = biome.vegetation.grassTypes[grassTypeIndex];
+                if (grass == null || grass.mesh == null || grass.material == null)
+                    continue;
+
+                List<Matrix4x4> list = entry.Value;
+                int offset = 0;
+                while (offset < list.Count)
+                {
+                    int batch = Mathf.Min(1023, list.Count - offset);
+                    for (int i = 0; i < batch; i++)
+                        grassBatchBuffer[i] = list[offset + i];
+
+                    Graphics.DrawMeshInstanced(
+                        grass.mesh, 0, grass.material, grassBatchBuffer, batch,
+                        grassPropertyBlock, ShadowCastingMode.Off, false);
+
+                    lastDrawnGrassCount += batch;
+                    offset += batch;
+                }
+            }
+        }
+    }
+
+    #endregion
+
+    #region LOD / Helpers
+
+    private int GetLodLevel(Vector2Int chunkCoord)
+    {
+        if (playerTransform == null)
+            return 0;
+
+        float distSq = ChunkDistanceSq(GetChunkCoordinates(playerTransform.position), chunkCoord);
+        if (distSq <= lod0Distance * lod0Distance) return 0;
+        if (distSq <= lod1Distance * lod1Distance) return 1;
+        return 2;
+    }
+
+    private int GetResolutionForLod(int lod)
+    {
+        int baseRes = Mathf.Clamp(renderResolution, 4, chunkSize);
+        if (lod <= 0) return baseRes;
+        if (lod == 1) return Mathf.Max(4, baseRes / 2);
+        return Mathf.Max(4, baseRes / 4);
+    }
+
+    private Vector2Int GetChunkCoordinates(Vector3 position)
+    {
+        return new Vector2Int(
+            Mathf.FloorToInt(position.x / chunkSize),
+            Mathf.FloorToInt(position.z / chunkSize));
+    }
+
+    private void EnsureSystems()
+    {
+        if (biomeSystem == null)
+        {
+            seed.Configure(worldSeed, seedString, useSeedString);
+            seed.Resolve();
+            EnsureDefaultBiomes();
+            biomeSystem = new BiomeSystem(
+                seed, biomes, worldRadius, capitalSpacing, capitalJitter,
+                borderWarpScale, borderWarpStrength, spawnBiomeRadius, biomeBlendDistance);
+        }
+    }
+
+    private void EnsureVertexCapacity(int count)
+    {
+        if (vertexBuffer != null && vertexBuffer.Length >= count)
+            return;
+
+        vertexBuffer = new Vector3[count];
+        uvBuffer = new Vector2[count];
+        uv2Buffer = new Vector2[count];
+        colorBuffer = new Color[count];
+        normalBuffer = new Vector3[count];
+    }
+
+    private void EnsureTriangleCapacity(int count)
+    {
+        if (triangleBuffer == null || triangleBuffer.Length < count)
+            triangleBuffer = new int[count];
+    }
+
+    private void EnsureDefaultMaterials()
+    {
+        if (grassMaterial == null)
+            grassMaterial = CreateDefaultMaterial(new Color(0.2f, 0.8f, 0.2f), "Grass");
+        if (dirtMaterial == null)
+            dirtMaterial = CreateDefaultMaterial(new Color(0.6f, 0.4f, 0.2f), "Dirt");
+        if (rockMaterial == null)
+            rockMaterial = CreateDefaultMaterial(new Color(0.5f, 0.5f, 0.5f), "Rock");
+        if (snowMaterial == null)
+            snowMaterial = CreateDefaultMaterial(new Color(0.9f, 0.9f, 0.95f), "Snow");
+    }
+
+    private void EnsureDefaultBiomes()
+    {
+        if (biomes != null && biomes.Length > 0)
+            return;
+
+        biomes = BiomePresets.CreateDefaultSet();
+        if (showDebugLogs)
+            Debug.Log("[TerrainGenerator] No biomes configured — using BiomePresets.CreateDefaultSet().", gameObject);
+    }
+
+    private void EnsureDefaultGrassPrototypes()
+    {
+        if (!createDefaultGrassIfMissing || biomes == null)
+            return;
+
+        defaultGrassMesh = VegetationRendererUtil.CreateDefaultGrassBladeMesh();
+        defaultGrassMaterial = VegetationRendererUtil.CreateDefaultGrassMaterial(new Color(0.3f, 0.7f, 0.2f));
+
+        for (int i = 0; i < biomes.Length; i++)
+        {
+            Biome biome = biomes[i];
+            if (biome == null)
+                continue;
+
+            if (biome.vegetation == null)
+                biome.vegetation = new BiomeVegetationSettings();
+            if (biome.terrain == null)
+                biome.terrain = BiomeTerrainSettings.CreateDefault();
+
+            if (biome.vegetation.grassTypes == null || biome.vegetation.grassTypes.Length == 0)
+            {
+                biome.vegetation.grassTypes = new[]
+                {
+                    new GrassType
+                    {
+                        mesh = defaultGrassMesh,
+                        material = defaultGrassMaterial,
+                        density = Mathf.Clamp01(biome.vegetation.density > 0f ? biome.vegetation.density : 0.7f),
+                        minScale = biome.vegetation.minScale,
+                        maxScale = biome.vegetation.maxScale,
+                        randomYRotation = biome.vegetation.randomRotation,
+                        maxSlope = biome.vegetation.slopeLimit
+                    }
+                };
+            }
+            else
+            {
+                for (int g = 0; g < biome.vegetation.grassTypes.Length; g++)
+                {
+                    GrassType gt = biome.vegetation.grassTypes[g];
+                    if (gt == null)
+                        continue;
+                    if (gt.mesh == null)
+                        gt.mesh = defaultGrassMesh;
+                    if (gt.material == null)
+                        gt.material = defaultGrassMaterial;
+                    else
+                        gt.material.enableInstancing = true;
+                }
+            }
+        }
+    }
+
+    private Material CreateDefaultMaterial(Color color, string name)
+    {
+        Shader shader = Shader.Find("Standard");
+        if (shader == null)
+            shader = Shader.Find("Universal Render Pipeline/Lit");
+        if (shader == null)
+            shader = Shader.Find("Sprites/Default");
+
+        return new Material(shader) { color = color, name = name };
+    }
+
+    private Material CreateFallbackTerrainMaterial()
+    {
+        Shader blend = Shader.Find("Custom/TerrainBiomeBlendURP");
+        if (blend == null)
+            blend = Shader.Find("Custom/TerrainBiomeBlend");
+
+        if (blend != null)
+        {
+            Material mat = new Material(blend) { name = "TerrainBiomeBlend_Runtime" };
+            ApplyBiomeTexturesToMaterial(mat);
+            return mat;
+        }
+
+        Shader shader = Shader.Find("Universal Render Pipeline/Lit");
+        if (shader == null)
+            shader = Shader.Find("Particles/Standard Unlit");
+        if (shader == null)
+            shader = Shader.Find("Sprites/Default");
+        if (shader == null)
+            shader = Shader.Find("Standard");
+
+        return new Material(shader) { name = "TerrainFallback" };
+    }
+
+    private void ApplyBiomeTexturesToMaterial(Material mat)
+    {
+        if (biomes == null || mat == null)
+            return;
+
+        for (int i = 0; i < biomes.Length && i < 4; i++)
+        {
+            Biome b = biomes[i];
+            if (b == null)
+                continue;
+
+            string texProp = $"_BiomeTex{i}";
+            string colorProp = $"_BiomeColor{i}";
+            if (b.groundTexture != null && mat.HasProperty(texProp))
+                mat.SetTexture(texProp, b.groundTexture);
+            if (mat.HasProperty(colorProp))
+                mat.SetColor(colorProp, b.biomeColor);
+        }
+
+        if (mat.HasProperty("_BiomeCount"))
+            mat.SetFloat("_BiomeCount", Mathf.Min(biomes.Length, 4));
+    }
+
+    private void RefreshDeterminismProbe()
+    {
+        if (!chunkDataMap.TryGetValue(determinismProbeChunk, out TerrainChunkData data) || data.Heights == null)
+            return;
+
+        float centerHeight = data.SampleHeightBilinear(chunkSize * 0.5f, chunkSize * 0.5f);
+        BiomeSample centerBiome = SampleBiomeFromData(data, chunkSize * 0.5f, chunkSize * 0.5f);
+        lastDeterminismReport =
+            $"Seed: {seed.ResolvedSeed}\n" +
+            $"Chunk: {determinismProbeChunk}\n" +
+            $"Biome: {(centerBiome.primaryBiome != null ? centerBiome.primaryBiome.biomeName : "None")}\n" +
+            $"Height sample: {centerHeight:F3}\n" +
+            $"Grass count: {data.GrassInstanceCount}\n" +
+            $"Object count: {data.ObjectInstanceCount}\n" +
+            $"Fingerprint: {data.DeterminismFingerprint}";
+    }
+
+    #endregion
+}
+
+// =============================================================================
+// World Seed
+// =============================================================================
+
+[Serializable]
+public class WorldSeed
+{
+    public const string SystemWorld = "World";
+    public const string SystemTerrain = "Terrain";
+    public const string SystemBiome = "Biome";
+    public const string SystemObjects = "Objects";
+    public const string SystemGrass = "Grass";
+    public const string SystemRocks = "Rocks";
+    public const string SystemTrees = "Trees";
+    public const string SystemDecorations = "Decorations";
+
+    [SerializeField] private int worldSeed = 12345;
+    [SerializeField] private string seedString = "";
+    [SerializeField] private bool useSeedString;
+
+    private int resolvedSeed;
+    private bool initialized;
+
+    public int ResolvedSeed => initialized ? resolvedSeed : Resolve();
+
+    public void Configure(int seed, string text, bool useText)
+    {
+        worldSeed = seed;
+        seedString = text ?? string.Empty;
+        useSeedString = useText;
+        initialized = false;
+    }
+
+    public int Resolve()
+    {
+        resolvedSeed = useSeedString && !string.IsNullOrWhiteSpace(seedString)
+            ? HashSeedString(seedString)
+            : worldSeed;
+        if (resolvedSeed == 0)
+            resolvedSeed = 1;
+        initialized = true;
+        return resolvedSeed;
+    }
+
+    public int GetSystemSeed(string systemName)
+    {
+        EnsureResolved();
+        return Mix(resolvedSeed, HashSeedString(systemName ?? string.Empty));
+    }
+
+    public int GetChunkSeed(Vector2Int chunkCoord, string systemName)
+    {
+        int s = GetSystemSeed(systemName);
+        s = Mix(s, chunkCoord.x);
+        return Mix(s, chunkCoord.y);
+    }
+
+    public int GetPositionSeed(Vector2Int chunkCoord, int x, int z, string systemName)
+    {
+        int s = GetChunkSeed(chunkCoord, systemName);
+        s = Mix(s, x);
+        return Mix(s, z);
+    }
+
+    public static int HashSeedString(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return 1;
+
+        unchecked
+        {
+            int hash = 216613626;
+            for (int i = 0; i < value.Length; i++)
+            {
+                hash ^= value[i];
+                hash *= 16777619;
+            }
+
+            return hash == 0 ? 1 : hash;
+        }
+    }
+
+    public static int Mix(int seed, int value)
+    {
+        unchecked
+        {
+            int h = seed;
+            h ^= value * -862048943;
+            h = (h << 13) | (h >> 19);
+            h *= 5 + -2048144789;
+            h ^= h >> 16;
+            return h == 0 ? 1 : h;
+        }
+    }
+
+    public static float ToFloat01(int hash)
+    {
+        unchecked
+        {
+            uint u = (uint)hash;
+            return (u & 0x00FFFFFF) / 16777216f;
+        }
+    }
+
+    public static float ToFloatRange(int hash, float min, float max) => min + ToFloat01(hash) * (max - min);
+
+    public System.Random CreateRandom(string systemName) => new System.Random(GetSystemSeed(systemName));
+
+    public System.Random CreateChunkRandom(Vector2Int chunkCoord, string systemName) =>
+        new System.Random(GetChunkSeed(chunkCoord, systemName));
+
+    private void EnsureResolved()
+    {
+        if (!initialized)
+            Resolve();
+    }
+}
+
+// =============================================================================
+// Noise
+// =============================================================================
+
+[Serializable]
+public class TerrainNoiseSettings
+{
+    [Header("Continental / Large Scale")]
+    public float continentalScale = 420f;
+    [Range(0f, 2f)] public float continentalStrength = 0.55f;
+
+    [Header("Mountain / Landform")]
+    public float mountainScale = 180f;
+    [Range(0f, 2f)] public float mountainStrength = 0.35f;
+
+    [Header("Detail")]
+    public float detailScale = 55f;
+    [Range(0f, 1.5f)] public float detailStrength = 0.25f;
+
+    [Header("Micro Detail")]
+    public float microScale = 18f;
+    [Range(0f, 1f)] public float microStrength = 0.08f;
+
+    [Header("Domain Warp")]
+    public float warpScale = 90f;
+    public float warpStrength = 28f;
+}
+
+public static class TerrainNoise
+{
+    public static float SamplePerlin(WorldSeed worldSeed, string systemName, float x, float z, float scale, float channelOffset)
+    {
+        float safeScale = Mathf.Max(0.0001f, scale);
+        int systemSeed = worldSeed != null ? worldSeed.GetSystemSeed(systemName) : 1;
+        float seedOffsetX = (systemSeed % 100000) * 0.137f + channelOffset * 17.13f;
+        float seedOffsetZ = (systemSeed % 100000) * 0.311f + channelOffset * 9.71f;
+        return Mathf.PerlinNoise((x + seedOffsetX) / safeScale, (z + seedOffsetZ) / safeScale);
+    }
+
+    public static Vector2 DomainWarp(WorldSeed worldSeed, string systemName, float x, float z, float warpScale, float warpStrength)
+    {
+        float wx = (SamplePerlin(worldSeed, systemName, x, z, warpScale, 11.3f) - 0.5f) * 2f * warpStrength;
+        float wz = (SamplePerlin(worldSeed, systemName, x, z, warpScale, 47.8f) - 0.5f) * 2f * warpStrength;
+        return new Vector2(x + wx, z + wz);
+    }
+
+    public static float SampleLayeredBase(WorldSeed worldSeed, TerrainNoiseSettings settings, float worldX, float worldZ)
+    {
+        if (settings == null)
+            settings = new TerrainNoiseSettings();
+
+        float continental = SamplePerlin(worldSeed, WorldSeed.SystemTerrain, worldX, worldZ, settings.continentalScale, 1.1f);
+        float mountain = SamplePerlin(worldSeed, WorldSeed.SystemTerrain, worldX, worldZ, settings.mountainScale, 2.7f);
+        float detail = SamplePerlin(worldSeed, WorldSeed.SystemTerrain, worldX, worldZ, settings.detailScale, 4.2f);
+        float micro = SamplePerlin(worldSeed, WorldSeed.SystemTerrain, worldX, worldZ, settings.microScale, 6.9f);
+
+        float mountainRidged = 1f - Mathf.Abs(mountain * 2f - 1f);
+        mountainRidged *= mountainRidged;
+
+        float value =
+            continental * settings.continentalStrength +
+            mountainRidged * settings.mountainStrength +
+            detail * settings.detailStrength +
+            micro * settings.microStrength;
+
+        float norm = settings.continentalStrength + settings.mountainStrength + settings.detailStrength + settings.microStrength;
+        if (norm > 0.0001f)
+            value /= norm;
+
+        return Mathf.Clamp01(value);
+    }
+
+    public static float EvaluateBiomeTerrain(
+        WorldSeed worldSeed,
+        BiomeTerrainSettings terrain,
+        TerrainNoiseSettings globalNoise,
+        float worldX,
+        float worldZ)
+    {
+        if (terrain == null)
+            terrain = BiomeTerrainSettings.CreateDefault();
+        if (globalNoise == null)
+            globalNoise = new TerrainNoiseSettings();
+
+        float continentalScale = terrain.continentalScale > 0.01f ? terrain.continentalScale : globalNoise.continentalScale;
+        float detailScale = terrain.detailScale > 0.01f ? terrain.detailScale : globalNoise.detailScale;
+        float mountainScale = terrain.mountainScale > 0.01f ? terrain.mountainScale : globalNoise.mountainScale;
+
+        float continental = SamplePerlin(worldSeed, WorldSeed.SystemTerrain, worldX, worldZ, continentalScale, 10.1f);
+        float detail = SamplePerlin(worldSeed, WorldSeed.SystemTerrain, worldX, worldZ, detailScale, 20.2f);
+        float mountain = SamplePerlin(worldSeed, WorldSeed.SystemTerrain, worldX, worldZ, mountainScale, 30.3f);
+        float mountainRidged = 1f - Mathf.Abs(mountain * 2f - 1f);
+        mountainRidged *= mountainRidged;
+        float roughness = SamplePerlin(worldSeed, WorldSeed.SystemTerrain, worldX, worldZ, detailScale * 0.45f, 40.4f);
+
+        float shaped = Mathf.Clamp01(continental * 0.55f + detail * terrain.detailStrength + roughness * terrain.roughness * 0.35f);
+        shaped = terrain.elevationCurve != null ? terrain.elevationCurve.Evaluate(shaped) : shaped;
+
+        return terrain.baseHeight + shaped * terrain.heightMultiplier + mountainRidged * terrain.mountainStrength;
+    }
+}
+
+// =============================================================================
+// Biome definitions
+// =============================================================================
+
+[Serializable]
+public class BiomeTerrainSettings
+{
+    public float baseHeight = 2f;
+    public float heightMultiplier = 12f;
+    public float continentalScale = 420f;
+    public float detailScale = 55f;
+    [Range(0f, 2f)] public float detailStrength = 0.35f;
+    public AnimationCurve elevationCurve = AnimationCurve.EaseInOut(0f, 0f, 1f, 1f);
+    [Range(0f, 40f)] public float mountainStrength = 4f;
+    public float mountainScale = 180f;
+    [Range(0f, 1.5f)] public float roughness = 0.25f;
+
+    public static BiomeTerrainSettings CreateDefault() => new BiomeTerrainSettings();
+
+    public static BiomeTerrainSettings CreateMeadows() => new BiomeTerrainSettings
+    {
+        baseHeight = 1.5f, heightMultiplier = 8f, continentalScale = 480f, detailScale = 70f,
+        detailStrength = 0.22f, mountainStrength = 1.5f, mountainScale = 220f, roughness = 0.12f,
+        elevationCurve = AnimationCurve.EaseInOut(0f, 0f, 1f, 0.85f)
+    };
+
+    public static BiomeTerrainSettings CreateForest() => new BiomeTerrainSettings
+    {
+        baseHeight = 3f, heightMultiplier = 14f, continentalScale = 400f, detailScale = 48f,
+        detailStrength = 0.45f, mountainStrength = 5f, mountainScale = 170f, roughness = 0.35f,
+        elevationCurve = AnimationCurve.EaseInOut(0f, 0.05f, 1f, 1f)
+    };
+
+    public static BiomeTerrainSettings CreateMountains() => new BiomeTerrainSettings
+    {
+        baseHeight = 8f, heightMultiplier = 28f, continentalScale = 360f, detailScale = 40f,
+        detailStrength = 0.55f, mountainStrength = 22f, mountainScale = 140f, roughness = 0.7f,
+        elevationCurve = new AnimationCurve(new Keyframe(0f, 0f), new Keyframe(0.45f, 0.25f), new Keyframe(1f, 1f))
+    };
+
+    public static BiomeTerrainSettings CreateSwamp() => new BiomeTerrainSettings
+    {
+        baseHeight = 0.4f, heightMultiplier = 3.5f, continentalScale = 520f, detailScale = 90f,
+        detailStrength = 0.12f, mountainStrength = 0.4f, mountainScale = 260f, roughness = 0.08f,
+        elevationCurve = AnimationCurve.Linear(0f, 0.15f, 1f, 0.45f)
+    };
+
+    public static BiomeTerrainSettings CreatePlains() => new BiomeTerrainSettings
+    {
+        baseHeight = 2f, heightMultiplier = 6f, continentalScale = 600f, detailScale = 110f,
+        detailStrength = 0.15f, mountainStrength = 1.2f, mountainScale = 280f, roughness = 0.1f,
+        elevationCurve = AnimationCurve.EaseInOut(0f, 0.1f, 1f, 0.65f)
+    };
+}
+
+[Serializable]
+public class GrassType
+{
+    public Mesh mesh;
+    public Material material;
+    [Range(0f, 1f)] public float density = 0.8f;
+    public float minScale = 0.8f;
+    public float maxScale = 1.25f;
+    [Range(0f, 360f)] public float randomYRotation = 360f;
+    public float minElevation = -999f;
+    public float maxElevation = 999f;
+    public float maxSlope = 35f;
+}
+
+[Serializable]
+public class BiomeVegetationSettings
+{
+    public GrassType[] grassTypes;
+    [Range(0f, 1f)] public float density = 0.7f;
+    public float minScale = 0.85f;
+    public float maxScale = 1.2f;
+    [Range(0f, 360f)] public float randomRotation = 360f;
+    public float minElevation = -999f;
+    public float maxElevation = 999f;
+    public float slopeLimit = 35f;
+    public float nearDistance = 40f;
+    public float farDistance = 120f;
+}
+
+[Serializable]
+public class BiomeObject
+{
+    public enum ObjectCategory { Important, Decorative }
+
+    public GameObject prefab;
+    public ObjectCategory category = ObjectCategory.Important;
+    [Range(0f, 1f)] public float spawnChance = 0.1f;
+    public float minimumDistance = 1f;
+    public float minElevation = -999f;
+    public float maxElevation = 999f;
+    public float maxSlope = 25f;
+    public float yOffset;
+    public float minXRotation;
+    public float maxXRotation;
+    public float minYRotation;
+    public float maxYRotation = 360f;
+}
+
+[Serializable]
+public struct BiomeSample
+{
+    public Biome primaryBiome;
+    public Biome secondaryBiome;
+    public Biome tertiaryBiome;
+    public float primaryWeight;
+    public float secondaryWeight;
+    public float tertiaryWeight;
+
+    public static BiomeSample FromSingle(Biome biome) => new BiomeSample
+    {
+        primaryBiome = biome,
+        primaryWeight = 1f
+    };
+
+    public void Normalize()
+    {
+        float sum = primaryWeight + secondaryWeight + tertiaryWeight;
+        if (sum <= 0.0001f)
+        {
+            primaryWeight = 1f;
+            secondaryWeight = 0f;
+            tertiaryWeight = 0f;
+            return;
+        }
+
+        primaryWeight /= sum;
+        secondaryWeight /= sum;
+        tertiaryWeight /= sum;
+    }
+}
+
+[Serializable]
+public class Biome
+{
+    [Header("Biome Info")]
+    public string biomeName = "Meadows";
+    [TextArea(1, 2)] public string biomeDescription = "Open grasslands near spawn";
+
+    [Header("World Ring (Valheim-style)")]
+    public bool isSpawnBiome;
+    [Range(0f, 1f)] public float minDistanceFromCenter;
+    [Range(0f, 1f)] public float maxDistanceFromCenter = 1f;
+
+    [Header("Biome Spawning")]
+    [Range(0f, 1f)] public float spawnChance = 0.5f;
+    [Range(0f, 1f)] public float spreadChance = 0.7f;
+
+    [Header("Elevation Range")]
+    public float minElevation;
+    public float maxElevation = 100f;
+
+    [Header("Terrain Profile")]
+    public BiomeTerrainSettings terrain = null;
+
+    [Header("Biome Material")]
+    public Material biomeMaterial;
+    public Color biomeColor = Color.green;
+    public Texture2D groundTexture;
+    public Vector2 textureTiling = new Vector2(2f, 2f);
+
+    [Header("Vegetation (GPU Instanced Grass)")]
+    public BiomeVegetationSettings vegetation = new BiomeVegetationSettings();
+
+    [Header("Objects (GameObjects)")]
+    public BiomeObject[] objects;
+
+    [NonSerialized] public int runtimeIndex = -1;
+}
+
+public static class BiomePresets
+{
+    public static Biome CreateMeadows() => new Biome
+    {
+        biomeName = "Meadows",
+        biomeDescription = "Open grasslands near spawn",
+        isSpawnBiome = true,
+        minDistanceFromCenter = 0f,
+        maxDistanceFromCenter = 0.35f,
+        spawnChance = 0.9f,
+        spreadChance = 0.85f,
+        maxElevation = 40f,
+        biomeColor = new Color(0.35f, 0.75f, 0.25f),
+        terrain = BiomeTerrainSettings.CreateMeadows(),
+        vegetation = new BiomeVegetationSettings { density = 0.80f, slopeLimit = 35f, nearDistance = 40f, farDistance = 120f }
+    };
+
+    public static Biome CreateBlackForest() => new Biome
+    {
+        biomeName = "Black Forest",
+        minDistanceFromCenter = 0.2f,
+        maxDistanceFromCenter = 0.65f,
+        spawnChance = 0.7f,
+        spreadChance = 0.75f,
+        minElevation = 1f,
+        maxElevation = 55f,
+        biomeColor = new Color(0.12f, 0.35f, 0.14f),
+        terrain = BiomeTerrainSettings.CreateForest(),
+        vegetation = new BiomeVegetationSettings { density = 0.65f, slopeLimit = 32f, nearDistance = 35f, farDistance = 110f }
+    };
+
+    public static Biome CreateSwamp() => new Biome
+    {
+        biomeName = "Swamp",
+        minDistanceFromCenter = 0.35f,
+        maxDistanceFromCenter = 0.75f,
+        spawnChance = 0.45f,
+        spreadChance = 0.6f,
+        maxElevation = 12f,
+        biomeColor = new Color(0.28f, 0.35f, 0.18f),
+        terrain = BiomeTerrainSettings.CreateSwamp(),
+        vegetation = new BiomeVegetationSettings { density = 0.50f, slopeLimit = 25f, nearDistance = 30f, farDistance = 90f }
+    };
+
+    public static Biome CreateMountains() => new Biome
+    {
+        biomeName = "Mountains",
+        minDistanceFromCenter = 0.45f,
+        maxDistanceFromCenter = 1f,
+        spawnChance = 0.55f,
+        spreadChance = 0.7f,
+        minElevation = 10f,
+        maxElevation = 200f,
+        biomeColor = new Color(0.55f, 0.55f, 0.58f),
+        terrain = BiomeTerrainSettings.CreateMountains(),
+        vegetation = new BiomeVegetationSettings { density = 0.10f, slopeLimit = 40f, nearDistance = 25f, farDistance = 80f }
+    };
+
+    public static Biome CreatePlains() => new Biome
+    {
+        biomeName = "Plains",
+        minDistanceFromCenter = 0.15f,
+        maxDistanceFromCenter = 0.55f,
+        spawnChance = 0.5f,
+        spreadChance = 0.65f,
+        maxElevation = 30f,
+        biomeColor = new Color(0.55f, 0.75f, 0.30f),
+        terrain = BiomeTerrainSettings.CreatePlains(),
+        vegetation = new BiomeVegetationSettings { density = 0.95f, slopeLimit = 30f, nearDistance = 45f, farDistance = 130f }
+    };
+
+    public static Biome[] CreateDefaultSet() => new[]
+    {
+        CreateMeadows(),
+        CreateBlackForest(),
+        CreateSwamp(),
+        CreateMountains(),
+        CreatePlains()
+    };
+}
+
+// =============================================================================
+// Biome system
+// =============================================================================
+
+public class BiomeSystem
+{
+    private struct BiomeCapital
+    {
+        public Vector2 worldPosition;
+        public Biome biome;
+        public float influence;
+        public float claimRadius;
+    }
+
+    private readonly WorldSeed worldSeed;
+    private readonly Biome[] biomes;
+    private readonly float worldRadius;
+    private readonly float capitalSpacing;
+    private readonly float capitalJitter;
+    private readonly float borderWarpScale;
+    private readonly float borderWarpStrength;
+    private readonly float spawnBiomeRadius;
+    private readonly float biomeBlendDistance;
+    private readonly List<BiomeCapital> capitals = new List<BiomeCapital>(256);
+    private readonly Dictionary<Vector2Int, BiomeSample[]> chunkCornerCache = new Dictionary<Vector2Int, BiomeSample[]>(256);
+    private Biome spawnBiome;
+
+    public Biome SpawnBiome => spawnBiome;
+    public int CapitalCount => capitals.Count;
+
+    public BiomeSystem(
+        WorldSeed worldSeed,
+        Biome[] biomes,
+        float worldRadius,
+        float capitalSpacing,
+        float capitalJitter,
+        float borderWarpScale,
+        float borderWarpStrength,
+        float spawnBiomeRadius,
+        float biomeBlendDistance)
+    {
+        this.worldSeed = worldSeed;
+        this.biomes = biomes;
+        this.worldRadius = Mathf.Max(1f, worldRadius);
+        this.capitalSpacing = Mathf.Max(40f, capitalSpacing);
+        this.capitalJitter = Mathf.Clamp(capitalJitter, 0f, 0.5f);
+        this.borderWarpScale = Mathf.Max(1f, borderWarpScale);
+        this.borderWarpStrength = borderWarpStrength;
+        this.spawnBiomeRadius = Mathf.Max(0f, spawnBiomeRadius);
+        this.biomeBlendDistance = Mathf.Max(1f, biomeBlendDistance);
+
+        AssignRuntimeIndices();
+        spawnBiome = FindSpawnBiome();
+        GenerateCapitals();
+    }
+
+    private void AssignRuntimeIndices()
+    {
+        if (biomes == null) return;
+        for (int i = 0; i < biomes.Length; i++)
+            if (biomes[i] != null)
+                biomes[i].runtimeIndex = i;
+    }
+
+    private Biome FindSpawnBiome()
+    {
+        if (biomes == null || biomes.Length == 0)
+            return null;
+
+        for (int i = 0; i < biomes.Length; i++)
+            if (biomes[i] != null && biomes[i].isSpawnBiome)
+                return biomes[i];
+
+        return biomes[0];
+    }
+
+    private void GenerateCapitals()
+    {
+        capitals.Clear();
+        if (biomes == null || biomes.Length == 0)
+            return;
+
+        System.Random capitalRandom = worldSeed.CreateRandom(WorldSeed.SystemBiome);
+        float spacing = capitalSpacing;
+        int gridRadius = Mathf.CeilToInt(worldRadius / spacing) + 1;
+
+        if (spawnBiome != null)
+        {
+            capitals.Add(new BiomeCapital
+            {
+                worldPosition = Vector2.zero,
+                biome = spawnBiome,
+                influence = Mathf.Clamp01(spawnBiome.spreadChance + 0.25f),
+                claimRadius = Mathf.Max(spawnBiomeRadius, spacing * 0.9f)
+            });
+        }
+
+        for (int gx = -gridRadius; gx <= gridRadius; gx++)
+        {
+            for (int gz = -gridRadius; gz <= gridRadius; gz++)
+            {
+                if (gx == 0 && gz == 0)
+                    continue;
+
+                float jitterX = ((float)capitalRandom.NextDouble() * 2f - 1f) * spacing * capitalJitter;
+                float jitterZ = ((float)capitalRandom.NextDouble() * 2f - 1f) * spacing * capitalJitter;
+                Vector2 worldPos = new Vector2(gx * spacing + jitterX, gz * spacing + jitterZ);
+                float distanceFromCenter = worldPos.magnitude;
+                if (distanceFromCenter > worldRadius || distanceFromCenter < spawnBiomeRadius * 0.75f)
+                    continue;
+
+                float normalizedDistance = Mathf.Clamp01(distanceFromCenter / worldRadius);
+                Biome biome = SelectBiomeForDistance(normalizedDistance, capitalRandom);
+                if (biome == null)
+                    continue;
+
+                float influence = Mathf.Clamp01(biome.spreadChance);
+                capitals.Add(new BiomeCapital
+                {
+                    worldPosition = worldPos,
+                    biome = biome,
+                    influence = influence,
+                    claimRadius = spacing * Mathf.Lerp(0.85f, 1.45f, influence)
+                });
+            }
+        }
+    }
+
+    private Biome SelectBiomeForDistance(float normalizedDistance, System.Random random)
+    {
+        Biome bestFallback = null;
+        float bestFallbackScore = float.MaxValue;
+        float totalWeight = 0f;
+        int candidateCount = 0;
+        Biome[] candidates = new Biome[biomes.Length];
+        float[] weights = new float[biomes.Length];
+
+        for (int i = 0; i < biomes.Length; i++)
+        {
+            Biome biome = biomes[i];
+            if (biome == null)
+                continue;
+
+            float mid = (biome.minDistanceFromCenter + biome.maxDistanceFromCenter) * 0.5f;
+            float score = Mathf.Abs(mid - normalizedDistance);
+            if (score < bestFallbackScore)
+            {
+                bestFallbackScore = score;
+                bestFallback = biome;
+            }
+
+            if (normalizedDistance < biome.minDistanceFromCenter || normalizedDistance > biome.maxDistanceFromCenter)
+                continue;
+
+            float weight = Mathf.Max(0.01f, biome.spawnChance);
+            if (biome.isSpawnBiome && normalizedDistance > 0.15f)
+                weight *= 0.15f;
+
+            candidates[candidateCount] = biome;
+            weights[candidateCount] = weight;
+            totalWeight += weight;
+            candidateCount++;
+        }
+
+        if (candidateCount == 0)
+            return bestFallback ?? biomes[0];
+
+        float roll = (float)random.NextDouble() * totalWeight;
+        float accumulated = 0f;
+        for (int i = 0; i < candidateCount; i++)
+        {
+            accumulated += weights[i];
+            if (roll <= accumulated)
+                return candidates[i];
+        }
+
+        return candidates[candidateCount - 1];
+    }
+
+    public BiomeSample SampleBiome(float worldX, float worldZ)
+    {
+        if (biomes == null || biomes.Length == 0)
+            return default;
+
+        float distanceFromCenter = Mathf.Sqrt(worldX * worldX + worldZ * worldZ);
+        if (spawnBiome != null && distanceFromCenter <= spawnBiomeRadius - biomeBlendDistance)
+            return BiomeSample.FromSingle(spawnBiome);
+
+        Vector2 warped = TerrainNoise.DomainWarp(worldSeed, WorldSeed.SystemBiome, worldX, worldZ, borderWarpScale, borderWarpStrength);
+
+        BiomeCapital c0 = default, c1 = default, c2 = default;
+        float s0 = float.MaxValue, s1 = float.MaxValue, s2 = float.MaxValue;
+        bool has0 = false, has1 = false, has2 = false;
+
+        for (int i = 0; i < capitals.Count; i++)
+        {
+            BiomeCapital capital = capitals[i];
+            float dx = warped.x - capital.worldPosition.x;
+            float dz = warped.y - capital.worldPosition.y;
+            float distance = Mathf.Sqrt(dx * dx + dz * dz);
+            float softness = Mathf.Lerp(1.15f, 0.55f, capital.influence);
+            float score = distance * softness / Mathf.Max(0.01f, capital.claimRadius);
+
+            int biasHash = WorldSeed.Mix(
+                worldSeed.GetSystemSeed(WorldSeed.SystemBiome),
+                WorldSeed.Mix((int)(capital.worldPosition.x * 10f), (int)(capital.worldPosition.y * 10f)));
+            score += WorldSeed.ToFloat01(biasHash) * 0.05f;
+
+            if (score < s0)
+            {
+                s2 = s1; c2 = c1; has2 = has1;
+                s1 = s0; c1 = c0; has1 = has0;
+                s0 = score; c0 = capital; has0 = true;
+            }
+            else if (score < s1)
+            {
+                s2 = s1; c2 = c1; has2 = has1;
+                s1 = score; c1 = capital; has1 = true;
+            }
+            else if (score < s2)
+            {
+                s2 = score; c2 = capital; has2 = true;
+            }
+        }
+
+        if (!has0)
+            return BiomeSample.FromSingle(spawnBiome ?? biomes[0]);
+
+        BiomeSample sample = BuildBlendSample(c0, s0, has1 ? c1 : c0, s1, has2 ? c2 : c0, s2, has1, has2);
+
+        if (spawnBiome != null && distanceFromCenter < spawnBiomeRadius + biomeBlendDistance)
+        {
+            float t = Mathf.InverseLerp(spawnBiomeRadius + biomeBlendDistance, spawnBiomeRadius - biomeBlendDistance, distanceFromCenter);
+            t = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(t));
+            if (t > 0.001f)
+                sample = LerpTowardBiome(sample, spawnBiome, t);
+        }
+
+        return sample;
+    }
+
+    private BiomeSample BuildBlendSample(
+        BiomeCapital nearest, float nearestScore,
+        BiomeCapital second, float secondScore,
+        BiomeCapital third, float thirdScore,
+        bool hasSecond, bool hasThird)
+    {
+        float edge = biomeBlendDistance / Mathf.Max(1f, capitalSpacing);
+        float d0 = nearestScore;
+        float d1 = hasSecond ? secondScore : d0 + 10f;
+        float d2 = hasThird ? thirdScore : d1 + 10f;
+
+        float gap01 = Mathf.Max(0.0001f, d1 - d0);
+        float blend01 = 1f - Mathf.SmoothStep(0f, edge, gap01);
+
+        float w0 = 1f;
+        float w1 = 0f;
+        float w2 = 0f;
+
+        if (hasSecond && nearest.biome != second.biome)
+        {
+            w1 = blend01 * 0.5f;
+            w0 = 1f - w1;
+        }
+
+        if (hasThird && third.biome != nearest.biome && third.biome != second.biome)
+        {
+            float gap02 = Mathf.Max(0.0001f, d2 - d0);
+            float blend02 = 1f - Mathf.SmoothStep(0f, edge * 1.25f, gap02);
+            w2 = blend02 * 0.25f;
+            float rem = 1f - w2;
+            w0 *= rem;
+            w1 *= rem;
+        }
+
+        BiomeSample sample = new BiomeSample
+        {
+            primaryBiome = nearest.biome,
+            secondaryBiome = hasSecond ? second.biome : null,
+            tertiaryBiome = hasThird ? third.biome : null,
+            primaryWeight = w0,
+            secondaryWeight = w1,
+            tertiaryWeight = w2
+        };
+        sample.Normalize();
+        return sample;
+    }
+
+    private static BiomeSample LerpTowardBiome(BiomeSample sample, Biome target, float t)
+    {
+        if (sample.primaryBiome == target)
+        {
+            sample.primaryWeight = Mathf.Lerp(sample.primaryWeight, 1f, t);
+            sample.secondaryWeight *= 1f - t;
+            sample.tertiaryWeight *= 1f - t;
+            sample.Normalize();
+            return sample;
+        }
+
+        sample.tertiaryBiome = sample.secondaryBiome;
+        sample.tertiaryWeight = sample.secondaryWeight * (1f - t);
+        sample.secondaryBiome = sample.primaryBiome;
+        sample.secondaryWeight = sample.primaryWeight * (1f - t);
+        sample.primaryBiome = target;
+        sample.primaryWeight = Mathf.Lerp(0f, 1f, t);
+        sample.Normalize();
+        return sample;
+    }
+
+    public BiomeSample ApplyElevationGate(BiomeSample sample, float elevationEstimate, float normalizedDistance)
+    {
+        if (sample.primaryBiome != null &&
+            elevationEstimate >= sample.primaryBiome.minElevation &&
+            elevationEstimate <= sample.primaryBiome.maxElevation)
+            return sample;
+
+        Biome replacement = FindBiomeForElevation(elevationEstimate, normalizedDistance);
+        return replacement == null ? sample : LerpTowardBiome(sample, replacement, 0.85f);
+    }
+
+    private Biome FindBiomeForElevation(float elevation, float normalizedDistance)
+    {
+        Biome best = null;
+        float bestScore = float.MaxValue;
+        if (biomes == null)
+            return null;
+
+        for (int i = 0; i < biomes.Length; i++)
+        {
+            Biome biome = biomes[i];
+            if (biome == null || elevation < biome.minElevation || elevation > biome.maxElevation)
+                continue;
+
+            float mid = (biome.minDistanceFromCenter + biome.maxDistanceFromCenter) * 0.5f;
+            float score = Mathf.Abs(mid - normalizedDistance) - biome.spawnChance;
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best = biome;
+            }
+        }
+
+        return best;
+    }
+
+    public BiomeSample[] GetOrCreateChunkCornerSamples(Vector2Int chunkCoord, int chunkSize)
+    {
+        if (chunkCornerCache.TryGetValue(chunkCoord, out BiomeSample[] cached))
+            return cached;
+
+        float x0 = chunkCoord.x * chunkSize;
+        float z0 = chunkCoord.y * chunkSize;
+        float x1 = x0 + chunkSize;
+        float z1 = z0 + chunkSize;
+
+        BiomeSample[] corners =
+        {
+            SampleBiome(x0, z0),
+            SampleBiome(x1, z0),
+            SampleBiome(x0, z1),
+            SampleBiome(x1, z1)
+        };
+        chunkCornerCache[chunkCoord] = corners;
+        return corners;
+    }
+
+    public BiomeSample SampleBiomeBilinear(BiomeSample[] corners, float u, float v)
+    {
+        BiomeSample a = LerpSamples(corners[0], corners[1], u);
+        BiomeSample b = LerpSamples(corners[2], corners[3], u);
+        return LerpSamples(a, b, v);
+    }
+
+    private static BiomeSample LerpSamples(BiomeSample a, BiomeSample b, float t)
+    {
+        t = Mathf.Clamp01(t);
+        if (t <= 0f) return a;
+        if (t >= 1f) return b;
+
+        if (a.primaryBiome == b.primaryBiome)
+        {
+            BiomeSample s = a;
+            s.primaryWeight = Mathf.Lerp(a.primaryWeight, b.primaryWeight, t);
+            s.secondaryWeight = Mathf.Lerp(a.secondaryWeight, b.secondaryWeight, t);
+            s.tertiaryWeight = Mathf.Lerp(a.tertiaryWeight, b.tertiaryWeight, t);
+            if (s.secondaryBiome == null) s.secondaryBiome = b.secondaryBiome;
+            s.Normalize();
+            return s;
+        }
+
+        BiomeSample blended = new BiomeSample
+        {
+            primaryBiome = t < 0.5f ? a.primaryBiome : b.primaryBiome,
+            secondaryBiome = t < 0.5f ? b.primaryBiome : a.primaryBiome,
+            tertiaryBiome = a.secondaryBiome ?? b.secondaryBiome,
+            primaryWeight = t < 0.5f ? 1f - t : t,
+            secondaryWeight = t < 0.5f ? t : 1f - t
+        };
+        blended.Normalize();
+        return blended;
+    }
+
+    public IReadOnlyList<Vector2> GetCapitalPositionsForDebug()
+    {
+        List<Vector2> list = new List<Vector2>(capitals.Count);
+        for (int i = 0; i < capitals.Count; i++)
+            list.Add(capitals[i].worldPosition);
+        return list;
+    }
+
+    public Color GetCapitalBiomeColor(int index)
+    {
+        if (index < 0 || index >= capitals.Count || capitals[index].biome == null)
+            return Color.magenta;
+        return capitals[index].biome.biomeColor;
+    }
+}
+
+// =============================================================================
+// Chunk data / scene wrapper
+// =============================================================================
+
+public class TerrainChunkData
+{
+    public enum ChunkState
+    {
+        Unloaded = 0,
+        Loaded = 1,
+        Generating = 2,
+        Generated = 3,
+        Visible = 4,
+        Hidden = 5,
+        Unloading = 6
+    }
+
+    public Vector2Int Coordinate { get; }
+    public int ChunkSize { get; }
+    public int Resolution { get; private set; }
+    public int LodLevel { get; private set; }
+    public ChunkState State { get; set; } = ChunkState.Unloaded;
+    public int GenerationToken { get; private set; }
+
+    public float[] Heights { get; private set; }
+    public BiomeSample[] BiomeSamples { get; private set; }
+    public Vector3[] Normals { get; private set; }
+    public Color[] VertexColors { get; private set; }
+
+    public int GrassInstanceCount { get; set; }
+    public int ObjectInstanceCount { get; set; }
+    public string DeterminismFingerprint { get; set; }
+
+    public TerrainChunkData(Vector2Int coordinate, int chunkSize)
+    {
+        Coordinate = coordinate;
+        ChunkSize = chunkSize;
+        State = ChunkState.Loaded;
+    }
+
+    public void BeginGeneration(int lodLevel, int resolution, int token)
+    {
+        LodLevel = lodLevel;
+        Resolution = resolution;
+        GenerationToken = token;
+        State = ChunkState.Generating;
+
+        int vertCount = (resolution + 1) * (resolution + 1);
+        Heights = new float[vertCount];
+        BiomeSamples = new BiomeSample[vertCount];
+        Normals = new Vector3[vertCount];
+        VertexColors = new Color[vertCount];
+        GrassInstanceCount = 0;
+        ObjectInstanceCount = 0;
+        DeterminismFingerprint = null;
+    }
+
+    public void Invalidate(int newToken)
+    {
+        GenerationToken = newToken;
+        State = ChunkState.Unloading;
+    }
+
+    public bool IsTokenValid(int token) => GenerationToken == token;
+
+    public void MarkGenerated() => State = ChunkState.Generated;
+    public void MarkVisible() => State = ChunkState.Visible;
+    public void MarkHidden() => State = ChunkState.Hidden;
+
+    public float GetHeight(int localX, int localZ)
+    {
+        if (Heights == null) return 0f;
+        int x = Mathf.Clamp(localX, 0, Resolution);
+        int z = Mathf.Clamp(localZ, 0, Resolution);
+        return Heights[z * (Resolution + 1) + x];
+    }
+
+    public BiomeSample GetBiomeSample(int localX, int localZ)
+    {
+        if (BiomeSamples == null) return default;
+        int x = Mathf.Clamp(localX, 0, Resolution);
+        int z = Mathf.Clamp(localZ, 0, Resolution);
+        return BiomeSamples[z * (Resolution + 1) + x];
+    }
+
+    public float SampleHeightBilinear(float localX, float localZ)
+    {
+        if (Heights == null || Resolution <= 0) return 0f;
+
+        float u = Mathf.Clamp(localX / ChunkSize * Resolution, 0f, Resolution);
+        float v = Mathf.Clamp(localZ / ChunkSize * Resolution, 0f, Resolution);
+        int x0 = Mathf.FloorToInt(u);
+        int z0 = Mathf.FloorToInt(v);
+        int x1 = Mathf.Min(x0 + 1, Resolution);
+        int z1 = Mathf.Min(z0 + 1, Resolution);
+        float tx = u - x0;
+        float tz = v - z0;
+
+        float h00 = Heights[z0 * (Resolution + 1) + x0];
+        float h10 = Heights[z0 * (Resolution + 1) + x1];
+        float h01 = Heights[z1 * (Resolution + 1) + x0];
+        float h11 = Heights[z1 * (Resolution + 1) + x1];
+        return Mathf.Lerp(Mathf.Lerp(h00, h10, tx), Mathf.Lerp(h01, h11, tx), tz);
+    }
+
+    public Vector3 SampleNormalBilinear(float localX, float localZ)
+    {
+        if (Normals == null || Resolution <= 0) return Vector3.up;
+
+        float u = Mathf.Clamp(localX / ChunkSize * Resolution, 0f, Resolution);
+        float v = Mathf.Clamp(localZ / ChunkSize * Resolution, 0f, Resolution);
+        int x0 = Mathf.FloorToInt(u);
+        int z0 = Mathf.FloorToInt(v);
+        int x1 = Mathf.Min(x0 + 1, Resolution);
+        int z1 = Mathf.Min(z0 + 1, Resolution);
+        float tx = u - x0;
+        float tz = v - z0;
+
+        Vector3 n00 = Normals[z0 * (Resolution + 1) + x0];
+        Vector3 n10 = Normals[z0 * (Resolution + 1) + x1];
+        Vector3 n01 = Normals[z1 * (Resolution + 1) + x0];
+        Vector3 n11 = Normals[z1 * (Resolution + 1) + x1];
+        return Vector3.Normalize(Vector3.Lerp(Vector3.Lerp(n00, n10, tx), Vector3.Lerp(n01, n11, tx), tz));
+    }
+
+    public void BuildFingerprint(int resolvedSeed)
+    {
+        float heightSum = 0f;
+        if (Heights != null)
+            for (int i = 0; i < Heights.Length; i++)
+                heightSum += Heights[i];
+
+        string primary = BiomeSamples != null && BiomeSamples.Length > 0 && BiomeSamples[0].primaryBiome != null
+            ? BiomeSamples[0].primaryBiome.biomeName
+            : "None";
+
+        DeterminismFingerprint =
+            $"Seed:{resolvedSeed} Chunk:{Coordinate} Biome:{primary} HeightSum:{heightSum:F3} Grass:{GrassInstanceCount} Objects:{ObjectInstanceCount}";
+    }
+}
+
+public struct VegetationInstance
+{
+    public Matrix4x4 matrix;
+    public int grassTypeIndex;
+    public int biomeIndex;
+}
+
+public class TerrainChunk : MonoBehaviour
+{
+    private TerrainChunkData data;
+    private MeshFilter meshFilter;
+    private MeshRenderer meshRenderer;
+    private MeshCollider meshCollider;
+    private Mesh renderMesh;
+    private Mesh colliderMesh;
+    private GameObject groundObject;
+    private Transform objectsRoot;
+    private readonly List<GameObject> spawnedObjects = new List<GameObject>(32);
+    private Dictionary<int, List<Matrix4x4>> grassMatrices;
+
+    public TerrainChunkData Data => data;
+    public Transform ObjectsRoot => objectsRoot;
+    public Dictionary<int, List<Matrix4x4>> GrassMatrices => grassMatrices;
+    public IReadOnlyList<GameObject> SpawnedObjects => spawnedObjects;
+
+    public void BindData(TerrainChunkData chunkData) => data = chunkData;
+
+    public void EnsureHierarchy(int groundLayerId)
+    {
+        if (groundObject != null)
+            return;
+
+        groundObject = new GameObject("Ground");
+        groundObject.transform.SetParent(transform, false);
+        groundObject.tag = "Ground";
+        groundObject.layer = groundLayerId;
+
+        meshFilter = groundObject.AddComponent<MeshFilter>();
+        meshRenderer = groundObject.AddComponent<MeshRenderer>();
+        meshCollider = groundObject.AddComponent<MeshCollider>();
+
+        GameObject objects = new GameObject("Objects");
+        objects.transform.SetParent(transform, false);
+        objectsRoot = objects.transform;
+        grassMatrices = new Dictionary<int, List<Matrix4x4>>(16);
+    }
+
+    public void ApplyRenderMesh(Mesh mesh, Material sharedMaterial)
+    {
+        if (renderMesh != null)
+            Destroy(renderMesh);
+        renderMesh = mesh;
+        meshFilter.sharedMesh = renderMesh;
+        meshRenderer.sharedMaterial = sharedMaterial;
+    }
+
+    public void ApplyColliderMesh(Mesh mesh)
+    {
+        if (colliderMesh != null && colliderMesh != renderMesh)
+            Destroy(colliderMesh);
+        colliderMesh = mesh;
+        meshCollider.sharedMesh = null;
+        meshCollider.sharedMesh = colliderMesh;
+    }
+
+    public void SetGrassMatrices(Dictionary<int, List<Matrix4x4>> matrices) => grassMatrices = matrices;
+
+    public void ClearGrassMatrices()
+    {
+        if (grassMatrices == null) return;
+        foreach (var kvp in grassMatrices)
+            kvp.Value.Clear();
+        grassMatrices.Clear();
+    }
+
+    public void RegisterSpawnedObject(GameObject go)
+    {
+        if (go != null)
+            spawnedObjects.Add(go);
+    }
+
+    public void ClearSpawnedObjects()
+    {
+        for (int i = 0; i < spawnedObjects.Count; i++)
+            if (spawnedObjects[i] != null)
+                Destroy(spawnedObjects[i]);
+        spawnedObjects.Clear();
+    }
+
+    private void OnDestroy()
+    {
+        ClearSpawnedObjects();
+        if (renderMesh != null) Destroy(renderMesh);
+        if (colliderMesh != null && colliderMesh != renderMesh) Destroy(colliderMesh);
+    }
+}
+
+// =============================================================================
+// Vegetation
+// =============================================================================
+
+public class VegetationSystem
+{
+    private readonly WorldSeed worldSeed;
+    private readonly float grassCellSize;
+    private readonly float maxSlopeDegrees;
+
+    public VegetationSystem(WorldSeed worldSeed, float grassCellSize, float maxSlopeDegrees = 45f)
+    {
+        this.worldSeed = worldSeed;
+        this.grassCellSize = Mathf.Max(0.5f, grassCellSize);
+        this.maxSlopeDegrees = maxSlopeDegrees;
+    }
+
+    public void GenerateGrass(
+        TerrainChunkData chunkData,
+        Vector3 playerPosition,
+        float vegetationFarDistance,
+        List<VegetationInstance> output,
+        Dictionary<int, List<Matrix4x4>> matricesByGrassKey,
+        Biome[] biomes)
+    {
+        output.Clear();
+        matricesByGrassKey.Clear();
+        if (chunkData == null || chunkData.BiomeSamples == null || chunkData.Heights == null)
+            return;
+
+        int chunkSize = chunkData.ChunkSize;
+        Vector2Int coord = chunkData.Coordinate;
+        float originX = coord.x * chunkSize;
+        float originZ = coord.y * chunkSize;
+        float cell = grassCellSize;
+        int cells = Mathf.Max(1, Mathf.CeilToInt(chunkSize / cell));
+        float farDistSq = vegetationFarDistance * vegetationFarDistance;
+
+        for (int cz = 0; cz < cells; cz++)
+        {
+            for (int cx = 0; cx < cells; cx++)
+            {
+                int hash = worldSeed.GetPositionSeed(coord, cx, cz, WorldSeed.SystemGrass);
+                float roll = WorldSeed.ToFloat01(hash);
+                float jitterX = WorldSeed.ToFloat01(WorldSeed.Mix(hash, 11));
+                float jitterZ = WorldSeed.ToFloat01(WorldSeed.Mix(hash, 29));
+
+                float localX = (cx + jitterX) * cell;
+                float localZ = (cz + jitterZ) * cell;
+                if (localX < 0f || localZ < 0f || localX > chunkSize || localZ > chunkSize)
+                    continue;
+
+                float worldX = originX + localX;
+                float worldZ = originZ + localZ;
+                float dx = worldX - playerPosition.x;
+                float dz = worldZ - playerPosition.z;
+                float distSq = dx * dx + dz * dz;
+                if (distSq > farDistSq)
+                    continue;
+
+                float height = chunkData.SampleHeightBilinear(localX, localZ);
+                Vector3 normal = chunkData.SampleNormalBilinear(localX, localZ);
+                float slope = Vector3.Angle(normal, Vector3.up);
+                if (slope > maxSlopeDegrees)
+                    continue;
+
+                BiomeSample biomeSample = SampleBiomeAtLocal(chunkData, localX, localZ);
+                TryPlaceGrassForBiome(biomeSample.primaryBiome, biomeSample.primaryWeight, hash, roll,
+                    worldX, height, worldZ, normal, slope, distSq, output, matricesByGrassKey);
+
+                if (biomeSample.secondaryBiome != null && biomeSample.secondaryWeight > 0.15f)
+                {
+                    int h2 = WorldSeed.Mix(hash, 77);
+                    TryPlaceGrassForBiome(biomeSample.secondaryBiome, biomeSample.secondaryWeight, h2,
+                        WorldSeed.ToFloat01(h2), worldX, height, worldZ, normal, slope, distSq, output, matricesByGrassKey);
+                }
+            }
+        }
+
+        chunkData.GrassInstanceCount = output.Count;
+    }
+
+    private void TryPlaceGrassForBiome(
+        Biome biome, float biomeWeight, int hash, float roll,
+        float worldX, float height, float worldZ, Vector3 terrainNormal, float slope, float distSq,
+        List<VegetationInstance> output, Dictionary<int, List<Matrix4x4>> matricesByGrassKey)
+    {
+        if (biome?.vegetation?.grassTypes == null || biome.vegetation.grassTypes.Length == 0)
+            return;
+
+        BiomeVegetationSettings veg = biome.vegetation;
+        if (height < veg.minElevation || height > veg.maxElevation || slope > veg.slopeLimit)
+            return;
+
+        float near = Mathf.Max(1f, veg.nearDistance);
+        float far = Mathf.Max(near + 0.01f, veg.farDistance);
+        float distanceFade = 1f - Mathf.SmoothStep(near, far, Mathf.Sqrt(distSq));
+        if (distanceFade <= 0.001f)
+            return;
+
+        float density = Mathf.Clamp01(veg.density) * Mathf.Clamp01(biomeWeight) * distanceFade;
+        if (roll > density)
+            return;
+
+        int typeIndex = SelectGrassType(veg.grassTypes, hash);
+        if (typeIndex < 0)
+            return;
+
+        GrassType grass = veg.grassTypes[typeIndex];
+        if (grass == null || grass.mesh == null)
+            return;
+        if (WorldSeed.ToFloat01(WorldSeed.Mix(hash, 13)) > Mathf.Clamp01(grass.density))
+            return;
+        if (height < grass.minElevation || height > grass.maxElevation || slope > grass.maxSlope)
+            return;
+
+        float minScale = grass.minScale > 0f ? grass.minScale : veg.minScale;
+        float maxScale = grass.maxScale > 0f ? grass.maxScale : veg.maxScale;
+        float scale = WorldSeed.ToFloatRange(WorldSeed.Mix(hash, 41), minScale, maxScale);
+        float yawMax = grass.randomYRotation > 0f ? grass.randomYRotation : veg.randomRotation;
+        float yaw = WorldSeed.ToFloat01(WorldSeed.Mix(hash, 53)) * yawMax;
+
+        Vector3 alignNormal = Vector3.Normalize(Vector3.Lerp(Vector3.up, terrainNormal, 0.25f));
+        Quaternion rotation = Quaternion.FromToRotation(Vector3.up, alignNormal) * Quaternion.Euler(0f, yaw, 0f);
+        Matrix4x4 matrix = Matrix4x4.TRS(new Vector3(worldX, height, worldZ), rotation, Vector3.one * scale);
+
+        int biomeIndex = biome.runtimeIndex >= 0 ? biome.runtimeIndex : 0;
+        int key = PackGrassKey(biomeIndex, typeIndex);
+        output.Add(new VegetationInstance { matrix = matrix, grassTypeIndex = typeIndex, biomeIndex = biomeIndex });
+
+        if (!matricesByGrassKey.TryGetValue(key, out List<Matrix4x4> list))
+        {
+            list = new List<Matrix4x4>(64);
+            matricesByGrassKey[key] = list;
+        }
+
+        list.Add(matrix);
+    }
+
+    private static int SelectGrassType(GrassType[] types, int hash)
+    {
+        float total = 0f;
+        for (int i = 0; i < types.Length; i++)
+            if (types[i] != null && types[i].mesh != null)
+                total += Mathf.Max(0.01f, types[i].density);
+
+        if (total <= 0f) return -1;
+
+        float pick = WorldSeed.ToFloat01(WorldSeed.Mix(hash, 19)) * total;
+        float acc = 0f;
+        for (int i = 0; i < types.Length; i++)
+        {
+            if (types[i] == null || types[i].mesh == null) continue;
+            acc += Mathf.Max(0.01f, types[i].density);
+            if (pick <= acc) return i;
+        }
+
+        return types.Length - 1;
+    }
+
+    private static BiomeSample SampleBiomeAtLocal(TerrainChunkData data, float localX, float localZ)
+    {
+        if (data.BiomeSamples == null || data.Resolution <= 0) return default;
+        float u = localX / data.ChunkSize * data.Resolution;
+        float v = localZ / data.ChunkSize * data.Resolution;
+        int x = Mathf.Clamp(Mathf.RoundToInt(u), 0, data.Resolution);
+        int z = Mathf.Clamp(Mathf.RoundToInt(v), 0, data.Resolution);
+        return data.BiomeSamples[z * (data.Resolution + 1) + x];
+    }
+
+    public static int PackGrassKey(int biomeIndex, int grassTypeIndex) => (biomeIndex << 16) | (grassTypeIndex & 0xFFFF);
+
+    public static void UnpackGrassKey(int key, out int biomeIndex, out int grassTypeIndex)
+    {
+        biomeIndex = key >> 16;
+        grassTypeIndex = key & 0xFFFF;
+    }
+}
+
+public static class VegetationRendererUtil
+{
+    public static Mesh CreateDefaultGrassBladeMesh()
+    {
+        Mesh mesh = new Mesh { name = "DefaultGrassBlade" };
+        mesh.vertices = new[]
+        {
+            new Vector3(-0.05f, 0f, 0f),
+            new Vector3(0.05f, 0f, 0f),
+            new Vector3(-0.04f, 0.35f, 0f),
+            new Vector3(0.04f, 0.45f, 0f),
+            new Vector3(0f, 0.7f, 0f)
+        };
+        mesh.triangles = new[] { 0, 2, 1, 1, 2, 3, 2, 4, 3 };
+        mesh.uv = new[]
+        {
+            new Vector2(0f, 0f), new Vector2(1f, 0f), new Vector2(0f, 0.5f),
+            new Vector2(1f, 0.65f), new Vector2(0.5f, 1f)
+        };
+        mesh.colors = new[]
+        {
+            new Color(0.25f, 0.55f, 0.15f, 1f),
+            new Color(0.25f, 0.55f, 0.15f, 1f),
+            new Color(0.35f, 0.7f, 0.2f, 1f),
+            new Color(0.35f, 0.7f, 0.2f, 1f),
+            new Color(0.45f, 0.85f, 0.25f, 1f)
+        };
+        mesh.RecalculateNormals();
+        mesh.RecalculateBounds();
+        return mesh;
+    }
+
+    public static Material CreateDefaultGrassMaterial(Color color)
+    {
+        Shader shader = Shader.Find("Universal Render Pipeline/Lit");
+        if (shader == null) shader = Shader.Find("Standard");
+        if (shader == null) shader = Shader.Find("Sprites/Default");
+
+        Material mat = new Material(shader) { name = "DefaultGrass", color = color, enableInstancing = true };
+        if (mat.HasProperty("_Color")) mat.SetColor("_Color", color);
+        if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", color);
+        return mat;
+    }
+}
+
+/// <summary>
+/// Optional companion component for determinism verification in Play Mode.
+/// </summary>
+[RequireComponent(typeof(TerrainGenerator))]
+public class TerrainDeterminismDebugger : MonoBehaviour
+{
+    [SerializeField] private Vector2Int probeChunk = Vector2Int.zero;
+    [SerializeField] private bool logOnChunkReady = true;
+    [SerializeField] private KeyCode reloadProbeKey = KeyCode.F6;
+
+    private TerrainGenerator generator;
+    private string cachedReport = "Waiting for chunk...";
+    private string firstFingerprint;
+
+    private void Awake() => generator = GetComponent<TerrainGenerator>();
+
+    private void Update()
+    {
+        if (generator == null) return;
+
+        TerrainChunkData data = generator.GetChunkData(probeChunk);
+        if (data == null || data.State < TerrainChunkData.ChunkState.Generated)
+            return;
+
+        float height = data.SampleHeightBilinear(data.ChunkSize * 0.5f, data.ChunkSize * 0.5f);
+        BiomeSample sample = data.GetBiomeSample(data.Resolution / 2, data.Resolution / 2);
+        string biomeName = sample.primaryBiome != null ? sample.primaryBiome.biomeName : "None";
+
+        cachedReport =
+            $"Seed: {generator.GetResolvedSeed()}\n" +
+            $"Chunk: {probeChunk}\n" +
+            $"Biome: {biomeName}\n" +
+            $"Height sample: {height:F3}\n" +
+            $"Grass count: {data.GrassInstanceCount}\n" +
+            $"Object count: {data.ObjectInstanceCount}\n" +
+            $"Fingerprint: {data.DeterminismFingerprint}";
+
+        if (string.IsNullOrEmpty(firstFingerprint))
+        {
+            firstFingerprint = data.DeterminismFingerprint;
+            if (logOnChunkReady)
+                Debug.Log("[Determinism] First sample:\n" + cachedReport, this);
+        }
+
+        if (Input.GetKeyDown(reloadProbeKey))
+            Debug.Log("[Determinism] Manual probe:\n" + cachedReport, this);
+    }
+
+    private void OnGUI()
+    {
+        GUI.Box(new Rect(12, 160, 440, 150), "Terrain Determinism Debugger");
+        GUI.Label(new Rect(24, 184, 416, 120), cachedReport);
+    }
+}
