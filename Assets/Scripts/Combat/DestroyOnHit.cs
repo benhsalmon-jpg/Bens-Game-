@@ -1,9 +1,9 @@
 using UnityEngine;
 
 /// <summary>
-/// Destructible resources (rocks, trees, etc.).
-/// Takes damage only from weapons on allowed layers.
-/// Implements IDamageable via DamageInfo (required by Weapon sweeps).
+/// Destructible resources (rocks, trees, etc.)
+/// Takes damage only from specific weapon layers.
+/// Implements IDamageable for System 2 combat (DamageInfo).
 /// </summary>
 public class DestroyOnHit : MonoBehaviour, IDamageable
 {
@@ -34,9 +34,16 @@ public class DestroyOnHit : MonoBehaviour, IDamageable
                 Debug.LogWarning($"[DestroyOnHit] {name} has no drop point, using transform.", this);
             dropPoint = transform;
         }
+
+        if (showDebugLogs)
+        {
+            Debug.Log(
+                $"[DestroyOnHit] {name} ready | HP {maxHealth} | layers {GetLayerMaskNames(damageFromLayers)} | drop {dropPoint.name}",
+                this);
+        }
     }
 
-    /// <summary>Required by IDamageable — this is what Weapon calls.</summary>
+    /// <summary>Required by IDamageable — Weapon calls this.</summary>
     public void TakeDamage(DamageInfo info)
     {
         if (isDestroyed)
@@ -48,7 +55,7 @@ public class DestroyOnHit : MonoBehaviour, IDamageable
         ApplyDamage(info.Amount);
     }
 
-    /// <summary>Legacy float entry point (other systems may still call this).</summary>
+    /// <summary>Optional helper for non-combat callers (not part of IDamageable).</summary>
     public void TakeDamage(float amount)
     {
         if (isDestroyed)
@@ -82,6 +89,17 @@ public class DestroyOnHit : MonoBehaviour, IDamageable
         }
 
         return canDamage;
+    }
+
+    private string GetLayerMaskNames(LayerMask mask)
+    {
+        string names = "";
+        for (int i = 0; i < 32; i++)
+        {
+            if ((mask & (1 << i)) != 0)
+                names += LayerMask.LayerToName(i) + ", ";
+        }
+        return names.TrimEnd(',', ' ');
     }
 
     private void BreakApart()
