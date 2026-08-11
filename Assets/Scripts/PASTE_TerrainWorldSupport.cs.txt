@@ -3,6 +3,9 @@ using System.Collections.Generic;
 using UnityEngine;
 
 // =============================================================================
+// Biome system + chunks + GPU vegetation (Part 2)
+// Paste as: Assets/Scripts/TerrainWorldSupport.cs
+// =============================================================================
 
 public class BiomeSystem
 {

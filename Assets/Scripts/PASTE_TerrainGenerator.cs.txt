@@ -1906,6 +1906,3 @@ public static class BiomePresets
         CreatePlains()
     };
 }
-
-// =============================================================================
-// Biome system
