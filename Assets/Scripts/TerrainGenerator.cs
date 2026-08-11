@@ -315,11 +315,18 @@ public class TerrainGenerator : MonoBehaviour
 
     private void OnGUI()
     {
+        if (showDebugLogs || showVegetationDensity)
+        {
+            GUI.Box(new Rect(12, 12, 320, 70), "Vegetation Debug");
+            GUI.Label(new Rect(24, 36, 300, 40),
+                $"Drawn grass instances: {lastDrawnGrassCount}\nActive chunks: {activeChunks.Count}");
+        }
+
         if (!enableDeterminismProbe || string.IsNullOrEmpty(lastDeterminismReport))
             return;
 
-        GUI.Box(new Rect(12, 12, 440, 150), "Determinism Probe");
-        GUI.Label(new Rect(24, 36, 416, 120), lastDeterminismReport);
+        GUI.Box(new Rect(12, 90, 440, 150), "Determinism Probe");
+        GUI.Label(new Rect(24, 114, 416, 120), lastDeterminismReport);
     }
 
     #endregion
@@ -2571,31 +2578,58 @@ public class VegetationSystem
 
 public static class VegetationRendererUtil
 {
+    /// <summary>
+    /// Crossed quad blade (2 planes) so grass is visible from all angles.
+    /// </summary>
     public static Mesh CreateDefaultGrassBladeMesh()
     {
         Mesh mesh = new Mesh { name = "DefaultGrassBlade" };
-        mesh.vertices = new[]
+
+        // Plane A (XY) + Plane B (ZY) — crossed billboard-style blade.
+        Vector3[] vertices =
         {
-            new Vector3(-0.05f, 0f, 0f),
-            new Vector3(0.05f, 0f, 0f),
-            new Vector3(-0.04f, 0.35f, 0f),
-            new Vector3(0.04f, 0.45f, 0f),
-            new Vector3(0f, 0.7f, 0f)
+            new Vector3(-0.18f, 0f, 0f),
+            new Vector3(0.18f, 0f, 0f),
+            new Vector3(-0.12f, 0.55f, 0f),
+            new Vector3(0.12f, 0.55f, 0f),
+            new Vector3(0f, 1.0f, 0f),
+
+            new Vector3(0f, 0f, -0.18f),
+            new Vector3(0f, 0f, 0.18f),
+            new Vector3(0f, 0.55f, -0.12f),
+            new Vector3(0f, 0.55f, 0.12f),
+            new Vector3(0f, 1.0f, 0f)
         };
-        mesh.triangles = new[] { 0, 2, 1, 1, 2, 3, 2, 4, 3 };
-        mesh.uv = new[]
+
+        // Front + back faces for both planes (Cull Off also recommended on material).
+        int[] triangles =
         {
-            new Vector2(0f, 0f), new Vector2(1f, 0f), new Vector2(0f, 0.5f),
-            new Vector2(1f, 0.65f), new Vector2(0.5f, 1f)
+            0, 2, 1, 1, 2, 3, 2, 4, 3,
+            1, 2, 0, 3, 2, 1, 3, 4, 2,
+            5, 7, 6, 6, 7, 8, 7, 9, 8,
+            6, 7, 5, 8, 7, 6, 8, 9, 7
         };
-        mesh.colors = new[]
+
+        Vector2[] uv =
         {
-            new Color(0.25f, 0.55f, 0.15f, 1f),
-            new Color(0.25f, 0.55f, 0.15f, 1f),
-            new Color(0.35f, 0.7f, 0.2f, 1f),
-            new Color(0.35f, 0.7f, 0.2f, 1f),
-            new Color(0.45f, 0.85f, 0.25f, 1f)
+            new Vector2(0f, 0f), new Vector2(1f, 0f), new Vector2(0f, 0.55f),
+            new Vector2(1f, 0.55f), new Vector2(0.5f, 1f),
+            new Vector2(0f, 0f), new Vector2(1f, 0f), new Vector2(0f, 0.55f),
+            new Vector2(1f, 0.55f), new Vector2(0.5f, 1f)
         };
+
+        Color tip = new Color(0.45f, 0.95f, 0.25f, 1f);
+        Color baseCol = new Color(0.15f, 0.55f, 0.1f, 1f);
+        Color[] colors =
+        {
+            baseCol, baseCol, tip, tip, tip,
+            baseCol, baseCol, tip, tip, tip
+        };
+
+        mesh.vertices = vertices;
+        mesh.triangles = triangles;
+        mesh.uv = uv;
+        mesh.colors = colors;
         mesh.RecalculateNormals();
         mesh.RecalculateBounds();
         return mesh;
@@ -2603,13 +2637,36 @@ public static class VegetationRendererUtil
 
     public static Material CreateDefaultGrassMaterial(Color color)
     {
-        Shader shader = Shader.Find("Universal Render Pipeline/Lit");
-        if (shader == null) shader = Shader.Find("Standard");
-        if (shader == null) shader = Shader.Find("Sprites/Default");
+        // Prefer a dedicated instancing-friendly unlit shader (Cull Off).
+        Shader shader = Shader.Find("Custom/GrassInstanced");
+        if (shader == null)
+            shader = Shader.Find("Universal Render Pipeline/Unlit");
+        if (shader == null)
+            shader = Shader.Find("Unlit/Color");
+        if (shader == null)
+            shader = Shader.Find("Sprites/Default");
+        if (shader == null)
+            shader = Shader.Find("Universal Render Pipeline/Lit");
+        if (shader == null)
+            shader = Shader.Find("Standard");
 
-        Material mat = new Material(shader) { name = "DefaultGrass", color = color, enableInstancing = true };
-        if (mat.HasProperty("_Color")) mat.SetColor("_Color", color);
-        if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", color);
+        Material mat = new Material(shader)
+        {
+            name = "DefaultGrass_Instanced",
+            enableInstancing = true,
+            hideFlags = HideFlags.DontSave
+        };
+
+        if (mat.HasProperty("_Color"))
+            mat.SetColor("_Color", color);
+        if (mat.HasProperty("_BaseColor"))
+            mat.SetColor("_BaseColor", color);
+        mat.color = color;
+
+        // Helpful for thin blades if using a lit shader that supports it.
+        if (mat.HasProperty("_Cull"))
+            mat.SetFloat("_Cull", 0f); // Off
+
         return mat;
     }
 }
