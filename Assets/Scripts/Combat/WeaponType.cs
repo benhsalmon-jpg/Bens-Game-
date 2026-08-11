@@ -1,7 +1,6 @@
-using UnityEngine;
-
 /// <summary>
 /// Weapon categories. Prefer this over string tags for combo lookup.
+/// Keep ONLY ONE copy of this enum in the project.
 /// </summary>
 public enum WeaponType
 {
