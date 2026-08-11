@@ -75,19 +75,21 @@ public class TerrainGenerator : MonoBehaviour
     [Header("Vegetation / GPU Instancing")]
     [Tooltip("Master toggle for GPU grass.")]
     [SerializeField] private bool enableGrass = true;
-    [Tooltip("Assign ANY mesh here (quad, grass blade FBX, bush, etc.). Used when a biome GrassType has no mesh.")]
-    [SerializeField] private Mesh grassMesh;
-    [Tooltip("Material MUST have Enable GPU Instancing checked. Prefer Custom/GrassInstanced or URP Unlit.")]
-    [SerializeField] private Material grassMaterial;
+    [Tooltip("Assign ANY mesh here (quad, grass blade FBX, bush, etc.).")]
+    [SerializeField] private Mesh vegetationMesh;
+    [Tooltip("Material MUST have Enable GPU Instancing. Prefer Custom/GrassInstanced or URP/Unlit.")]
+    [SerializeField] private Material vegetationMaterial;
     [Tooltip("World spacing between grass cells. Smaller = denser.")]
-    [SerializeField] private float grassCellSize = 1.5f;
-    [Range(0f, 2f)]
+    [SerializeField] private float grassCellSize = 1.25f;
+    [Range(0.05f, 2f)]
     [Tooltip("Multiplies every biome grass density.")]
     [SerializeField] private float grassDensityMultiplier = 1f;
     [SerializeField] private bool createDefaultGrassIfMissing = true;
     [SerializeField] private bool forceEnableInstancingOnMaterials = true;
     [Tooltip("Submesh index for assigned meshes (usually 0).")]
     [SerializeField] private int grassSubmeshIndex = 0;
+    [Tooltip("If true, ignores biome density=0 and still plants grass.")]
+    [SerializeField] private bool forceGrassWhenEnabled = true;
 
     [Header("Objects")]
     [SerializeField] private int maxObjectsPerChunk = 100;
@@ -160,6 +162,9 @@ public class TerrainGenerator : MonoBehaviour
     private bool generationLoopRunning;
     private string lastDeterminismReport = "";
     private int lastDrawnGrassCount;
+    private int lastGeneratedGrassCount;
+    private bool vegetationDirty = true;
+    private int emptyVegetationRebuildAttempts;
 
     #region Unity Lifecycle
 
@@ -327,18 +332,22 @@ public class TerrainGenerator : MonoBehaviour
 
     private void OnGUI()
     {
-        if (showDebugLogs || showVegetationDensity)
+        // Always show grass draw count while grass is enabled (easy GPU instancing debug).
+        if (enableGrass)
         {
-            GUI.Box(new Rect(12, 12, 320, 70), "Vegetation Debug");
-            GUI.Label(new Rect(24, 36, 300, 40),
-                $"Drawn grass instances: {lastDrawnGrassCount}\nActive chunks: {activeChunks.Count}");
+            GUI.Box(new Rect(12, 12, 360, 92), "GPU Grass Debug");
+            GUI.Label(new Rect(24, 36, 340, 64),
+                $"Generated: {lastGeneratedGrassCount} | Drawn: {lastDrawnGrassCount}\n" +
+                $"Mesh: {(vegetationMesh != null ? vegetationMesh.name : "NONE")} | " +
+                $"Mat: {(vegetationMaterial != null ? vegetationMaterial.name : "NONE")}\n" +
+                $"Chunks: {activeChunks.Count} | Enable={enableGrass}");
         }
 
         if (!enableDeterminismProbe || string.IsNullOrEmpty(lastDeterminismReport))
             return;
 
-        GUI.Box(new Rect(12, 90, 440, 150), "Determinism Probe");
-        GUI.Label(new Rect(24, 114, 416, 120), lastDeterminismReport);
+        GUI.Box(new Rect(12, 100, 440, 150), "Determinism Probe");
+        GUI.Label(new Rect(24, 124, 416, 120), lastDeterminismReport);
     }
 
     #endregion
@@ -591,21 +600,15 @@ public class TerrainGenerator : MonoBehaviour
         if (playerTransform != null && ChunkDistanceSq(GetChunkCoordinates(playerTransform.position), chunkCoord) <= objectDistSq)
             SpawnImportantObjects(chunk, data);
 
-        float vegDistSq = vegetationLoadDistance * vegetationLoadDistance;
-        if (enableGrass && playerTransform != null &&
-            ChunkDistanceSq(GetChunkCoordinates(playerTransform.position), chunkCoord) <= vegDistSq)
-        {
-            Dictionary<int, List<Matrix4x4>> matrices = new Dictionary<int, List<Matrix4x4>>(16);
-            vegetationSystem.GenerateGrass(data, playerTransform.position, vegetationLoadDistance, grassScratch, matrices, biomes);
-            chunk.SetGrassMatrices(matrices);
-        }
-
         data.MarkGenerated();
         data.MarkVisible();
         data.BuildFingerprint(seed.ResolvedSeed);
 
         activeChunks[chunkCoord] = chunk;
         totalChunksGenerated++;
+        // Always rebuild grass after a chunk finishes — player may not have moved enough
+        // for UpdateVegetationDistanceFade to run again.
+        vegetationDirty = true;
 
         if (showDebugLogs)
             Debug.Log($"[TerrainGenerator] Generated chunk {chunkCoord} | {data.DeterminismFingerprint}", gameObject);
@@ -983,14 +986,61 @@ public class TerrainGenerator : MonoBehaviour
         if (!enableGrass || playerTransform == null || vegetationSystem == null)
             return;
 
+        EnsureDefaultGrassPrototypes();
+
         Vector3 playerPos = playerTransform.position;
-        if ((playerPos - lastVegetationPlayerPos).sqrMagnitude < VegetationRefreshMoveThreshold * VegetationRefreshMoveThreshold)
+        bool movedEnough =
+            (playerPos - lastVegetationPlayerPos).sqrMagnitude >=
+            VegetationRefreshMoveThreshold * VegetationRefreshMoveThreshold;
+
+        if (movedEnough)
+            emptyVegetationRebuildAttempts = 0;
+
+        // Rebuild when the player moves, a chunk just finished, or nearby grass is still empty
+        // (capped so we don't spin every frame if planting truly fails).
+        bool needsEmptyRebuild =
+            vegetationDirty ||
+            (emptyVegetationRebuildAttempts < 4 && HasEmptyNearbyVegetation(playerPos));
+
+        if (!movedEnough && !needsEmptyRebuild)
             return;
 
+        if (!movedEnough && needsEmptyRebuild)
+            emptyVegetationRebuildAttempts++;
+
         lastVegetationPlayerPos = playerPos;
+        vegetationDirty = false;
+        RebuildAllVegetation(playerPos);
+    }
+
+    private bool HasEmptyNearbyVegetation(Vector3 playerPos)
+    {
+        Vector2Int playerChunk = GetChunkCoordinates(playerPos);
+        float vegLoadSq = vegetationLoadDistance * vegetationLoadDistance;
+        foreach (var kvp in activeChunks)
+        {
+            TerrainChunk chunk = kvp.Value;
+            if (chunk?.Data == null) continue;
+            if (ChunkDistanceSq(playerChunk, kvp.Key) > vegLoadSq) continue;
+
+            int count = chunk.Data.GrassInstanceCount;
+            if (count <= 0)
+                return true;
+            if (chunk.GrassMatrices == null || chunk.GrassMatrices.Count == 0)
+                return true;
+        }
+
+        return false;
+    }
+
+    private void RebuildAllVegetation(Vector3 playerPos)
+    {
         Vector2Int playerChunk = GetChunkCoordinates(playerPos);
         float vegLoadSq = vegetationLoadDistance * vegetationLoadDistance;
         float vegUnloadSq = vegetationUnloadDistance * vegetationUnloadDistance;
+        lastGeneratedGrassCount = 0;
+
+        vegetationSystem.forceGrassWhenEnabled = forceGrassWhenEnabled;
 
         foreach (var kvp in activeChunks)
         {
@@ -1002,18 +1052,27 @@ public class TerrainGenerator : MonoBehaviour
             if (distSq > vegUnloadSq)
             {
                 chunk.ClearGrassMatrices();
+                if (chunk.Data != null)
+                    chunk.Data.GrassInstanceCount = 0;
                 continue;
             }
 
-            if (distSq <= vegLoadSq)
-            {
-                Dictionary<int, List<Matrix4x4>> matrices = new Dictionary<int, List<Matrix4x4>>(16);
-                vegetationSystem.GenerateGrass(chunk.Data, playerPos, vegetationLoadDistance, grassScratch, matrices, biomes);
-                chunk.SetGrassMatrices(matrices);
+            if (distSq > vegLoadSq)
+                continue;
 
-                if (showVegetationDensity && showDebugLogs)
-                    Debug.Log($"[Vegetation] Chunk {kvp.Key} instances={chunk.Data.GrassInstanceCount}", gameObject);
-            }
+            Dictionary<int, List<Matrix4x4>> matrices = new Dictionary<int, List<Matrix4x4>>(16);
+            vegetationSystem.GenerateGrass(
+                chunk.Data,
+                playerPos,
+                vegetationLoadDistance,
+                grassScratch,
+                matrices,
+                biomes);
+            chunk.SetGrassMatrices(matrices);
+            lastGeneratedGrassCount += chunk.Data.GrassInstanceCount;
+
+            if (showVegetationDensity && showDebugLogs)
+                Debug.Log($"[Vegetation] Chunk {kvp.Key} instances={chunk.Data.GrassInstanceCount}", gameObject);
         }
     }
 
@@ -1021,6 +1080,12 @@ public class TerrainGenerator : MonoBehaviour
     {
         lastDrawnGrassCount = 0;
         if (!enableGrass)
+            return;
+
+        if (vegetationMesh == null || vegetationMaterial == null)
+            EnsureDefaultGrassPrototypes();
+
+        if (vegetationMesh == null || vegetationMaterial == null)
             return;
 
         Camera cam = Camera.main;
@@ -1034,30 +1099,33 @@ public class TerrainGenerator : MonoBehaviour
 
             foreach (var entry in matrices)
             {
+                List<Matrix4x4> list = entry.Value;
+                if (list == null || list.Count == 0)
+                    continue;
+
+                Mesh mesh = vegetationMesh;
+                Material mat = vegetationMaterial;
+
                 VegetationSystem.UnpackGrassKey(entry.Key, out int biomeIndex, out int grassTypeIndex);
-                if (biomes == null || biomeIndex < 0 || biomeIndex >= biomes.Length)
-                    continue;
+                if (biomes != null && biomeIndex >= 0 && biomeIndex < biomes.Length)
+                {
+                    Biome biome = biomes[biomeIndex];
+                    GrassType[] types = biome?.vegetation?.grassTypes;
+                    if (types != null && grassTypeIndex >= 0 && grassTypeIndex < types.Length)
+                    {
+                        GrassType grass = types[grassTypeIndex];
+                        if (grass != null)
+                        {
+                            if (grass.mesh != null) mesh = grass.mesh;
+                            if (grass.material != null) mat = grass.material;
+                        }
+                    }
+                }
 
-                Biome biome = biomes[biomeIndex];
-                if (biome?.vegetation?.grassTypes == null)
-                    continue;
-                if (grassTypeIndex < 0 || grassTypeIndex >= biome.vegetation.grassTypes.Length)
-                    continue;
-
-                GrassType grass = biome.vegetation.grassTypes[grassTypeIndex];
-                if (grass == null)
-                    continue;
-
-                Mesh mesh = grass.mesh != null ? grass.mesh : grassMesh;
-                Material mat = grass.material != null ? grass.material : grassMaterial;
                 if (mesh == null || mat == null)
                     continue;
 
                 PrepareGrassMaterial(mat);
-
-                List<Matrix4x4> list = entry.Value;
-                if (list == null || list.Count == 0)
-                    continue;
 
                 int submesh = Mathf.Clamp(grassSubmeshIndex, 0, Mathf.Max(0, mesh.subMeshCount - 1));
                 int offset = 0;
@@ -1171,18 +1239,18 @@ public class TerrainGenerator : MonoBehaviour
 
     private void EnsureDefaultGrassPrototypes()
     {
-        // Resolve global fallbacks first.
-        if (grassMesh == null && createDefaultGrassIfMissing)
-            grassMesh = VegetationRendererUtil.CreateDefaultGrassBladeMesh();
+        // Resolve global vegetation fallbacks (separate from elevation grassMaterial).
+        if (vegetationMesh == null && createDefaultGrassIfMissing)
+            vegetationMesh = VegetationRendererUtil.CreateDefaultGrassBladeMesh();
 
-        if (grassMaterial == null && createDefaultGrassIfMissing)
-            grassMaterial = VegetationRendererUtil.CreateDefaultGrassMaterial(new Color(0.25f, 0.85f, 0.2f, 1f));
+        if (vegetationMaterial == null && createDefaultGrassIfMissing)
+            vegetationMaterial = VegetationRendererUtil.CreateDefaultGrassMaterial(new Color(0.25f, 0.85f, 0.2f, 1f));
 
-        if (grassMaterial != null)
-            PrepareGrassMaterial(grassMaterial);
+        if (vegetationMaterial != null)
+            PrepareGrassMaterial(vegetationMaterial);
 
-        defaultGrassMesh = grassMesh;
-        defaultGrassMaterial = grassMaterial;
+        defaultGrassMesh = vegetationMesh;
+        defaultGrassMaterial = vegetationMaterial;
 
         if (biomes == null)
             return;
@@ -1198,23 +1266,30 @@ public class TerrainGenerator : MonoBehaviour
             if (biome.terrain == null)
                 biome.terrain = BiomeTerrainSettings.CreateDefault();
 
-            // Ensure at least one grass type so inspector mesh/material can show.
+            // Ensure usable density so grass actually plants.
+            if (forceGrassWhenEnabled && biome.vegetation.density < 0.05f)
+                biome.vegetation.density = 0.85f;
+            if (biome.vegetation.farDistance < biome.vegetation.nearDistance + 1f)
+                biome.vegetation.farDistance = Mathf.Max(vegetationLoadDistance, biome.vegetation.nearDistance + 40f);
+            if (biome.vegetation.slopeLimit < 5f)
+                biome.vegetation.slopeLimit = 45f;
+
             if (biome.vegetation.grassTypes == null || biome.vegetation.grassTypes.Length == 0)
             {
-                if (!createDefaultGrassIfMissing && grassMesh == null)
+                if (!createDefaultGrassIfMissing && vegetationMesh == null)
                     continue;
 
                 biome.vegetation.grassTypes = new[]
                 {
                     new GrassType
                     {
-                        mesh = grassMesh,
-                        material = grassMaterial,
-                        density = Mathf.Clamp01(biome.vegetation.density > 0.01f ? biome.vegetation.density : 0.85f),
+                        mesh = vegetationMesh,
+                        material = vegetationMaterial,
+                        density = 1f,
                         minScale = biome.vegetation.minScale > 0f ? biome.vegetation.minScale : 0.85f,
                         maxScale = biome.vegetation.maxScale > 0f ? biome.vegetation.maxScale : 1.35f,
-                        randomYRotation = biome.vegetation.randomRotation > 0f ? biome.vegetation.randomRotation : 360f,
-                        maxSlope = biome.vegetation.slopeLimit > 0f ? biome.vegetation.slopeLimit : 40f
+                        randomYRotation = 360f,
+                        maxSlope = Mathf.Max(40f, biome.vegetation.slopeLimit)
                     }
                 };
             }
@@ -1223,22 +1298,23 @@ public class TerrainGenerator : MonoBehaviour
             {
                 GrassType gt = biome.vegetation.grassTypes[g];
                 if (gt == null)
-                {
                     biome.vegetation.grassTypes[g] = gt = new GrassType();
-                }
 
-                // Inspector override: empty slots inherit the global TerrainGenerator mesh/material.
                 if (gt.mesh == null)
-                    gt.mesh = grassMesh;
+                    gt.mesh = vegetationMesh;
                 if (gt.material == null)
-                    gt.material = grassMaterial;
+                    gt.material = vegetationMaterial;
+                if (forceGrassWhenEnabled && gt.density < 0.05f)
+                    gt.density = 1f;
+                if (gt.maxSlope < 5f)
+                    gt.maxSlope = 45f;
 
                 if (gt.material != null)
                     PrepareGrassMaterial(gt.material);
             }
         }
 
-        if (showDebugLogs)
+        if (showDebugLogs || enableGrass)
         {
             int configured = 0;
             for (int i = 0; i < biomes.Length; i++)
@@ -1252,7 +1328,11 @@ public class TerrainGenerator : MonoBehaviour
                 }
             }
 
-            Debug.Log($"[TerrainGenerator] Grass ready. GlobalMesh={(grassMesh != null ? grassMesh.name : "null")} GlobalMat={(grassMaterial != null ? grassMaterial.name : "null")} ConfiguredTypes={configured}", this);
+            Debug.Log(
+                $"[TerrainGenerator] Grass ready. Mesh={(vegetationMesh != null ? vegetationMesh.name : "null")} " +
+                $"Mat={(vegetationMaterial != null ? vegetationMaterial.name : "null")} Types={configured} " +
+                $"Cell={grassCellSize} DensityMul={grassDensityMultiplier}",
+                this);
         }
     }
 
@@ -1264,9 +1344,12 @@ public class TerrainGenerator : MonoBehaviour
         if (forceEnableInstancingOnMaterials)
             mat.enableInstancing = true;
 
-        // Helpful defaults for thin vegetation.
         if (mat.HasProperty("_Cull"))
             mat.SetFloat("_Cull", 0f);
+        if (mat.HasProperty("_Color") && mat.GetColor("_Color").a < 0.01f)
+            mat.SetColor("_Color", new Color(0.25f, 0.85f, 0.2f, 1f));
+        if (mat.HasProperty("_BaseColor") && mat.GetColor("_BaseColor").a < 0.01f)
+            mat.SetColor("_BaseColor", new Color(0.25f, 0.85f, 0.2f, 1f));
     }
 
     private Material CreateDefaultMaterial(Color color, string name)
@@ -1625,9 +1708,9 @@ public class BiomeTerrainSettings
 [Serializable]
 public class GrassType
 {
-    [Tooltip("Assign ANY mesh (grass blade, bush, rock detail, etc.). Leave empty to use TerrainGenerator.grassMesh.")]
+    [Tooltip("Assign ANY mesh (grass blade, bush, rock detail, etc.). Leave empty to use TerrainGenerator Vegetation Mesh.")]
     public Mesh mesh;
-    [Tooltip("Must have Enable GPU Instancing. Leave empty to use TerrainGenerator.grassMaterial.")]
+    [Tooltip("Must have Enable GPU Instancing. Leave empty to use TerrainGenerator Vegetation Material.")]
     public Material material;
     [Range(0f, 1f)] public float density = 1f;
     public float minScale = 0.85f;
@@ -1823,3 +1906,6 @@ public static class BiomePresets
         CreatePlains()
     };
 }
+
+// =============================================================================
+// Biome system
