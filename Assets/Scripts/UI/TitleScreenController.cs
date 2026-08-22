@@ -1,9 +1,11 @@
+using System.Collections;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 
 /// <summary>
-/// Title screen UI controller. Wire the Play button OnClick to <see cref="OnPlayPressed"/>.
+/// Title / Menu screen controller. Wire Play OnClick to <see cref="OnPlayPressed"/>.
+/// Loads scene "Current" in Single mode and refreshes lighting after the load.
 /// </summary>
 public class TitleScreenController : MonoBehaviour
 {
@@ -11,13 +13,17 @@ public class TitleScreenController : MonoBehaviour
     [Tooltip("Exact scene name as it appears in File > Build Settings.")]
     public string playSceneName = "Current";
 
+    [Tooltip("Always use Single so Menu lighting/fog/skybox are fully unloaded.")]
+    public bool unloadMenuCompletely = true;
+
     [Header("Optional UI")]
     public Button playButton;
     public Button quitButton;
 
+    private bool isLoading;
+
     private void Awake()
     {
-        // Ensure the title UI is readable on any resolution.
         EnsureCanvasScalesCorrectly();
 
         if (playButton != null)
@@ -34,28 +40,29 @@ public class TitleScreenController : MonoBehaviour
     }
 
     /// <summary>
-    /// Call this from the Play button's OnClick in the Inspector,
-    /// or it will be wired automatically if playButton is assigned.
+    /// Call from the Play button OnClick, or assign playButton for auto-wire.
     /// </summary>
     public void OnPlayPressed()
     {
+        if (isLoading)
+            return;
+
         if (string.IsNullOrWhiteSpace(playSceneName))
         {
             Debug.LogError("TitleScreenController: playSceneName is empty.", this);
             return;
         }
 
-        // Scene must be listed in File > Build Settings.
         if (!Application.CanStreamedLevelBeLoaded(playSceneName))
         {
             Debug.LogError(
                 $"TitleScreenController: Scene '{playSceneName}' cannot be loaded. " +
-                "Add it via File > Build Settings (and check the name matches exactly).",
+                "Add it via File > Build Settings (name must match exactly, e.g. Current).",
                 this);
             return;
         }
 
-        SceneManager.LoadScene(playSceneName);
+        StartCoroutine(LoadPlaySceneRoutine());
     }
 
     public void OnQuitPressed()
@@ -65,6 +72,27 @@ public class TitleScreenController : MonoBehaviour
 #else
         Application.Quit();
 #endif
+    }
+
+    private IEnumerator LoadPlaySceneRoutine()
+    {
+        isLoading = true;
+
+        LoadSceneMode mode = unloadMenuCompletely ? LoadSceneMode.Single : LoadSceneMode.Additive;
+        AsyncOperation op = SceneManager.LoadSceneAsync(playSceneName, mode);
+        if (op == null)
+        {
+            Debug.LogError($"TitleScreenController: LoadSceneAsync('{playSceneName}') failed.", this);
+            isLoading = false;
+            yield break;
+        }
+
+        while (!op.isDone)
+            yield return null;
+
+        // One frame later: RenderSettings from Current are active; refresh ambient/reflections.
+        yield return null;
+        SceneLoadLightingFix.RefreshLighting(SceneManager.GetActiveScene());
     }
 
     private void EnsureCanvasScalesCorrectly()
@@ -91,7 +119,6 @@ public class TitleScreenController : MonoBehaviour
         if (canvas.GetComponent<GraphicRaycaster>() == null)
             canvas.gameObject.AddComponent<GraphicRaycaster>();
 
-        // Stretch the root panel under the canvas so content fills the screen.
         RectTransform root = canvas.transform as RectTransform;
         if (root != null)
             StretchFull(root);
