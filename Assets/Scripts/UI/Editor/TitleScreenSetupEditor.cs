@@ -86,13 +86,8 @@ public static class TitleScreenSetupEditor
         controller.playButton = playButton;
         controller.quitButton = quitButton;
 
-        // Persistent OnClick wiring in the scene asset
-        SerializedObject playSo = new SerializedObject(playButton);
-        SerializedProperty onClick = playSo.FindProperty("m_OnClick");
-        // Also rely on runtime Awake wiring; add persistent listener for clarity in Inspector
         UnityEditor.Events.UnityEventTools.AddPersistentListener(playButton.onClick, controller.OnPlayPressed);
         UnityEditor.Events.UnityEventTools.AddPersistentListener(quitButton.onClick, controller.OnQuitPressed);
-        playSo.ApplyModifiedProperties();
 
         canvasGo.GetComponent<CanvasFitToScreen>().Apply();
 
