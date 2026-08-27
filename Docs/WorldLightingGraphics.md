@@ -60,9 +60,35 @@ Preset is saved in `PlayerPrefs` (`GraphicsQualityPreset`).
 
 ---
 
+## 4. Shadow LOD (distant shadows cheaper)
+
+There was cascade count per quality preset, but not a dedicated distance LOD.  
+`ShadowLodController` now does two things:
+
+1. **Cascade bias** — near cascades get more shadow-map resolution; far cascades cover more world space (blockier / cheaper distant shadows).
+2. **Caster cull** — renderers beyond a distance stop casting shadows entirely (big win with trees/props).
+
+| Preset | Full cast | Disable cast | Cascade bias |
+|--------|-----------|--------------|--------------|
+| Low | (shadows off) | — | — |
+| Medium | 30m | 55m | strong |
+| High | 45m | 90m | medium |
+| Max | 70m | 130m | mild |
+
+### Setup
+1. Add **`ShadowLodController`** next to `GraphicsSettingsController`
+2. Assign camera / player as **Distance Origin** (falls back to `Camera.main`)
+3. Optional: put **`ShadowLodOverride`** (AlwaysCast) on the player
+4. Optional: set **Never Cast Layers** to grass/detail layers
+
+After chunk spawns lots of props you can call `ShadowLodController.Instance.InvalidateRegistry()`.
+
+---
+
 ## Efficiency notes
 
 - Shadows dominate cost outdoors — Low/Medium help the most on weak GPUs
 - Keep grass on `ShadowCastingMode.Off` (already in TerrainGenerator)
 - Only one directional light
 - Prefer Trilight ambient over realtime GI for procedural worlds
+- Distant caster LOD + near-biased cascades stack with the quality presets

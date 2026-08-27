@@ -909,6 +909,9 @@ public class TerrainGenerator : MonoBehaviour
         }
 
         data.ObjectInstanceCount = spawned;
+
+        if (spawned > 0 && ShadowLodController.Instance != null)
+            ShadowLodController.Instance.InvalidateRegistry();
     }
 
     private void UpdateObjectStreaming()

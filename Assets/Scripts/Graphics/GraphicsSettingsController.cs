@@ -30,6 +30,8 @@ public class GraphicsSettingsController : MonoBehaviour
     [Header("Optional hooks")]
     [Tooltip("If assigned, sun shadow type / strength are synced with the preset.")]
     public OptimizedWorldLighting worldLighting;
+    [Tooltip("If assigned, applies distance-based shadow LOD (cascade bias + distant caster cull).")]
+    public ShadowLodController shadowLod;
 
     public GraphicsQualityPreset CurrentPreset { get; private set; } = GraphicsQualityPreset.High;
 
@@ -89,6 +91,14 @@ public class GraphicsSettingsController : MonoBehaviour
 
         if (worldLighting != null)
             worldLighting.ApplyShadowProfile(profile);
+
+        if (shadowLod == null)
+            shadowLod = ShadowLodController.Instance != null
+                ? ShadowLodController.Instance
+                : FindAnyObjectByType<ShadowLodController>();
+
+        if (shadowLod != null)
+            shadowLod.ApplyFromPreset(preset);
 
         if (save)
         {
@@ -154,8 +164,9 @@ public struct ShadowQualityProfile
                     projection = ShadowProjection.StableFit,
                     shadowDistance = 60f,
                     shadowCascades = 2,
-                    cascade2Split = 0.333f,
-                    cascade4Split = new Vector3(0.067f, 0.2f, 0.467f),
+                    // Near-biased: cascade 1 stays denser; cascade 2 covers the rest cheaper.
+                    cascade2Split = 0.22f,
+                    cascade4Split = new Vector3(0.05f, 0.15f, 0.35f),
                     shadowNearPlaneOffset = 1.5f,
                     softShadows = false,
                     shadowStrength = 0.8f,
@@ -173,8 +184,9 @@ public struct ShadowQualityProfile
                     projection = ShadowProjection.StableFit,
                     shadowDistance = 100f,
                     shadowCascades = 4,
-                    cascade2Split = 0.333f,
-                    cascade4Split = new Vector3(0.067f, 0.2f, 0.467f),
+                    cascade2Split = 0.25f,
+                    // Near-biased 4-cascade splits (distant cascades = lower texel density).
+                    cascade4Split = new Vector3(0.05f, 0.14f, 0.35f),
                     shadowNearPlaneOffset = 1f,
                     softShadows = true,
                     shadowStrength = 0.9f,
@@ -193,7 +205,7 @@ public struct ShadowQualityProfile
                     shadowDistance = 150f,
                     shadowCascades = 4,
                     cascade2Split = 0.25f,
-                    cascade4Split = new Vector3(0.05f, 0.15f, 0.4f),
+                    cascade4Split = new Vector3(0.04f, 0.12f, 0.32f),
                     shadowNearPlaneOffset = 0.5f,
                     softShadows = true,
                     shadowStrength = 1f,
