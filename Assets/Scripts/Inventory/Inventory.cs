@@ -58,15 +58,11 @@ public class Inventory : MonoBehaviour
 
     private StorageChest currentChest = null;
     private CharacterController playerController;
-    private bool wasControllerEnabled = false;
-    private bool wasMovementScriptEnabled = false;
-    private bool wasCameraScriptEnabled = false;
 
-    // Ref-counted freeze so nested OpenChest / inventory UI cannot overwrite saved
-    // enabled flags and leave the player permanently stuck.
-    private int freezeCount = 0;
-    private bool hasStoredFreezeState = false;
-    private bool inventoryUiFrozen = false;
+    private const string FreezeReasonInventory = "inventory";
+    private const string FreezeReasonChest = "chest";
+    private readonly HashSet<string> freezeReasons = new HashSet<string>();
+    private float nextFreezeWatchdogTime;
 
     private void Awake()
     {
@@ -123,22 +119,12 @@ public class Inventory : MonoBehaviour
             // Only toggle inventory if no chest is open
             if (currentChest == null)
             {
-                bool opening = !container.activeInHierarchy;
-                container.SetActive(opening);
-                SetGameplayCursor(!opening);
+                bool opening = container == null || !container.activeInHierarchy;
+                if (container != null)
+                    container.SetActive(opening);
 
-                // Keep freeze state in sync with the inventory panel.
-                // Without this, other UI that freezes the player can fight Tab open/close.
-                if (opening && !inventoryUiFrozen)
-                {
-                    FreezePlayer(true);
-                    inventoryUiFrozen = true;
-                }
-                else if (!opening && inventoryUiFrozen)
-                {
-                    FreezePlayer(false);
-                    inventoryUiFrozen = false;
-                }
+                SetGameplayCursor(!opening);
+                SetFrozen(FreezeReasonInventory, opening);
             }
         }
 
@@ -147,15 +133,16 @@ public class Inventory : MonoBehaviour
         {
             CloseChestUI();
         }
-        else if (currentChest == null && inventoryUiFrozen && Input.GetKeyDown(KeyCode.Escape))
+        else if (currentChest == null && HasFreezeReason(FreezeReasonInventory) && Input.GetKeyDown(KeyCode.Escape))
         {
             // Escape closes inventory the same way Tab does, and always releases freeze.
             if (container != null)
                 container.SetActive(false);
             SetGameplayCursor(true);
-            FreezePlayer(false);
-            inventoryUiFrozen = false;
+            SetFrozen(FreezeReasonInventory, false);
         }
+
+        WatchdogReleaseStaleFreeze();
 
         StartDrag();
         UpdateDragItemPosition();
@@ -609,7 +596,7 @@ public class Inventory : MonoBehaviour
         if (chest == null)
             return;
 
-        // Already viewing this chest — do not freeze again (would nest incorrectly before the fix).
+        // Already viewing this chest — do not restack freeze reasons.
         if (currentChest == chest && chestUI != null && chestUI.gameObject.activeSelf)
             return;
 
@@ -618,14 +605,14 @@ public class Inventory : MonoBehaviour
             CloseChestUI();
 
         currentChest = chest;
-        container.SetActive(true);
-        chestUI.gameObject.SetActive(true);
+        if (container != null)
+            container.SetActive(true);
+        if (chestUI != null)
+            chestUI.gameObject.SetActive(true);
         SetGameplayCursor(false);
 
         DisableOtherMenus();
-
-        // Inventory Tab may already hold a freeze — only add one chest freeze.
-        FreezePlayer(true);
+        SetFrozen(FreezeReasonChest, true);
     }
 
     public void CloseChestUI()
@@ -639,14 +626,13 @@ public class Inventory : MonoBehaviour
         if (chestUI != null)
             chestUI.gameObject.SetActive(false);
 
-        // If the player opened the chest from an already-open inventory, keep inventory open
-        // and keep the matching inventory freeze. Otherwise close everything and unfreeze.
-        bool keepInventoryOpen = inventoryUiFrozen;
+        // If inventory was opened with Tab, keep it open. Chest-only flow closes the bag too.
+        bool keepInventoryOpen = HasFreezeReason(FreezeReasonInventory);
         if (!keepInventoryOpen && container != null)
             container.SetActive(false);
 
-        SetGameplayCursor(keepInventoryOpen ? false : true);
-        FreezePlayer(false);
+        SetGameplayCursor(!keepInventoryOpen);
+        SetFrozen(FreezeReasonChest, false);
     }
 
     private void DisableOtherMenus()
@@ -679,112 +665,143 @@ public class Inventory : MonoBehaviour
     }
 
     /// <summary>
-    /// Ref-counted freeze. Nested UI (inventory + chest) can freeze/unfreeze safely
-    /// without losing the original CharacterController / movement / camera enabled state.
+    /// Legacy API used by chests / crafting tables. Named locks underneath so nested
+    /// true/true/false cannot leave the player permanently disabled.
     /// </summary>
     public void FreezePlayer(bool freeze)
     {
-        if (playerController == null)
-            playerController = FindAnyObjectByType<CharacterController>();
-
-        if (playerController == null)
-        {
-            Debug.LogWarning("CharacterController not found!");
-            return;
-        }
-
-        if (freeze)
-        {
-            if (freezeCount == 0)
-            {
-                // Capture enabled state only on the first freeze in a nest.
-                wasControllerEnabled = playerController.enabled;
-                wasMovementScriptEnabled = playerMovementScript != null && playerMovementScript.enabled;
-                wasCameraScriptEnabled = cameraScript != null && cameraScript.enabled;
-                hasStoredFreezeState = true;
-
-                playerController.enabled = false;
-
-                if (playerMovementScript != null)
-                    playerMovementScript.enabled = false;
-                else
-                    Debug.LogWarning("playerMovementScript is NULL!");
-
-                if (cameraScript != null)
-                    cameraScript.enabled = false;
-                else
-                    Debug.LogWarning("cameraScript is NULL!");
-            }
-
-            freezeCount++;
-            return;
-        }
-
-        // Unfreeze
-        if (freezeCount <= 0)
-        {
-            // Idempotent: already unfrozen. Still force-restore if something left us disabled.
-            EnsurePlayerUnfrozen();
-            return;
-        }
-
-        freezeCount--;
-        if (freezeCount > 0)
-            return;
-
-        RestorePlayerFromStoredFreezeState();
+        SetFrozen("external", freeze);
     }
+
+    public void SetFrozen(string reason, bool frozen)
+    {
+        if (string.IsNullOrEmpty(reason))
+            reason = "external";
+
+        if (frozen)
+            freezeReasons.Add(reason);
+        else
+            freezeReasons.Remove(reason);
+
+        ApplyFreezeState();
+    }
+
+    public bool HasFreezeReason(string reason)
+    {
+        return !string.IsNullOrEmpty(reason) && freezeReasons.Contains(reason);
+    }
+
+    public bool IsPlayerFrozen => freezeReasons.Count > 0;
 
     /// <summary>
     /// Hard reset used if UI is destroyed/disabled mid-freeze or count gets out of sync.
     /// </summary>
     public void EnsurePlayerUnfrozen()
     {
-        freezeCount = 0;
-        inventoryUiFrozen = false;
+        freezeReasons.Clear();
+        ApplyFreezeState();
+    }
 
-        if (hasStoredFreezeState)
-        {
-            RestorePlayerFromStoredFreezeState();
-            return;
-        }
+    private void ApplyFreezeState()
+    {
+        bool frozen = freezeReasons.Count > 0;
 
         if (playerController == null)
             playerController = FindAnyObjectByType<CharacterController>();
 
-        if (playerController != null)
+        if (playerMovementScript == null)
+            playerMovementScript = FindAnyObjectByType<CharacterMovementController>();
+
+        if (cameraScript == null && playerController != null)
+        {
+            MonoBehaviour[] behaviours = playerController.GetComponentsInChildren<MonoBehaviour>(true);
+            for (int i = 0; i < behaviours.Length; i++)
+            {
+                if (behaviours[i] == null)
+                    continue;
+                string typeName = behaviours[i].GetType().Name;
+                if (typeName.IndexOf("Camera", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    typeName.IndexOf("Look", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    typeName.IndexOf("Mouse", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    cameraScript = behaviours[i];
+                    break;
+                }
+            }
+        }
+
+        // Never disable CharacterController. Toggling it off is the main source of
+        // "stuck forever" after terrain colliders rebuild or a freeze lock leaks:
+        // Unity can leave the capsule inside geometry, and restoring a captured
+        // enabled=false flag never turns it back on.
+        if (playerController != null && !playerController.enabled && !frozen)
             playerController.enabled = true;
 
         if (playerMovementScript != null)
-            playerMovementScript.enabled = true;
+            playerMovementScript.enabled = !frozen;
+        else if (frozen)
+            Debug.LogWarning("playerMovementScript is NULL!");
 
         if (cameraScript != null)
-            cameraScript.enabled = true;
+            cameraScript.enabled = !frozen;
+        else if (frozen)
+            Debug.LogWarning("cameraScript is NULL!");
+
+        if (!frozen)
+            SetGameplayCursor(true);
     }
 
-    private void RestorePlayerFromStoredFreezeState()
+    /// <summary>
+    /// If every pause UI is closed but a freeze reason leaked (chest trigger,
+    /// missing unfreeze, external FreezePlayer(true) without false), release it.
+    /// This is what makes "random freeze after a while" recover instead of sticking.
+    /// </summary>
+    private void WatchdogReleaseStaleFreeze()
     {
-        if (playerController == null)
-            playerController = FindAnyObjectByType<CharacterController>();
+        if (Time.unscaledTime < nextFreezeWatchdogTime)
+            return;
 
-        // Prefer restoring the captured state; if we never captured, enable gameplay scripts.
-        if (playerController != null)
-            playerController.enabled = hasStoredFreezeState ? wasControllerEnabled : true;
+        nextFreezeWatchdogTime = Time.unscaledTime + 0.25f;
 
-        if (playerMovementScript != null)
-            playerMovementScript.enabled = hasStoredFreezeState ? wasMovementScriptEnabled : true;
+        bool pauseUiOpen = IsPauseUiOpen();
+        if (pauseUiOpen)
+            return;
 
-        if (cameraScript != null)
-            cameraScript.enabled = hasStoredFreezeState ? wasCameraScriptEnabled : true;
+        bool movementLocked =
+            freezeReasons.Count > 0 ||
+            (playerMovementScript != null && !playerMovementScript.enabled) ||
+            (cameraScript != null && !cameraScript.enabled) ||
+            (playerController != null && !playerController.enabled);
 
-        hasStoredFreezeState = false;
-        freezeCount = 0;
+        if (!movementLocked)
+            return;
+
+        Debug.LogWarning("Inventory watchdog: pause UI is closed but the player is still frozen. Releasing movement.");
+        freezeReasons.Clear();
+        ApplyFreezeState();
+    }
+
+    private bool IsPauseUiOpen()
+    {
+        if (currentChest != null)
+            return true;
+        if (container != null && container.activeInHierarchy)
+            return true;
+        if (chestUI != null && chestUI.gameObject.activeInHierarchy)
+            return true;
+        if (craftingMenu != null && craftingMenu.activeInHierarchy)
+            return true;
+        if (armoryMenu != null && armoryMenu.activeInHierarchy)
+            return true;
+        if (craftingtableMenu != null && craftingtableMenu.activeInHierarchy)
+            return true;
+        return false;
     }
 
     private void OnDisable()
     {
         // Scene unload / object disable while UI is open must not leave the player stuck.
-        if (freezeCount > 0 || inventoryUiFrozen)
+        if (freezeReasons.Count > 0)
             EnsurePlayerUnfrozen();
     }
 
