@@ -69,6 +69,12 @@ public static class WorldGraphicsBootstrap
         BindDistanceOrigin(shadowLod);
         EnsurePlayerAlwaysCasts();
 
+        PerformanceMonitor monitor = PerformanceMonitor.EnsureExists();
+        if (monitor != null && monitor.transform.parent == null && Application.isPlaying)
+        {
+            // Keep with the graphics root when possible, but PerformanceMonitor uses DontDestroyOnLoad itself.
+        }
+
         // Apply current preset so sun + LOD match saved quality
         controller.ApplyPreset(controller.CurrentPreset, save: false);
         shadowLod.InvalidateRegistry();
@@ -84,7 +90,7 @@ public static class WorldGraphicsBootstrap
                 shadowLod.transform.SetParent(controller.transform, true);
         }
 
-        return new WorldGraphicsRig(controller, lighting, shadowLod);
+        return new WorldGraphicsRig(controller, lighting, shadowLod, monitor);
     }
 
     public static void BindDistanceOrigin(ShadowLodController shadowLod)
@@ -150,15 +156,18 @@ public static class WorldGraphicsBootstrap
         public readonly GraphicsSettingsController controller;
         public readonly OptimizedWorldLighting lighting;
         public readonly ShadowLodController shadowLod;
+        public readonly PerformanceMonitor performanceMonitor;
 
         public WorldGraphicsRig(
             GraphicsSettingsController controller,
             OptimizedWorldLighting lighting,
-            ShadowLodController shadowLod)
+            ShadowLodController shadowLod,
+            PerformanceMonitor performanceMonitor = null)
         {
             this.controller = controller;
             this.lighting = lighting;
             this.shadowLod = shadowLod;
+            this.performanceMonitor = performanceMonitor;
         }
     }
 }

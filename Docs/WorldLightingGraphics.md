@@ -69,7 +69,26 @@ At runtime, `WorldGraphicsBootstrap` creates and links:
 **Editor (optional, saves into your scene):**
 1. Open `Current`
 2. **GameObject → Graphics → Setup World Lighting & Shadow LOD**
-3. **GameObject → Graphics → Add Quality Dropdown To Canvas** (optional UI)
+3. **GameObject → Graphics → Add Quality Dropdown To Canvas** (quality + FPS toggles)
+
+---
+
+## 5. FPS / RAM / CPU / GPU overlay
+
+`PerformanceMonitor` draws a tiny top-left overlay.
+
+| Stat | How | Cost |
+|------|-----|------|
+| FPS | smoothed frame time | tiny (only while enabled) |
+| RAM | Unity Profiler alloc/reserved/mono | ~1 Hz sample |
+| CPU | process CPU % | ~1 Hz sample |
+| GPU | FrameTimingManager / ProfilerRecorder when available | ~1 Hz; shows `n/a` if unsupported |
+
+**Off by default.** Enable via settings toggle (`Show FPS Overlay`). Extended stats toggle shows RAM/CPU/GPU.
+
+When disabled: no collectors, no GUI, no ProfilerRecorders — effectively zero runtime cost.
+
+Saved in PlayerPrefs: `PerfMonitor.Enabled`, `PerfMonitor.ShowExtras`.
 
 ---
 
