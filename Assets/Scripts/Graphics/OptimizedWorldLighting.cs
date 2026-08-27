@@ -50,6 +50,13 @@ public class OptimizedWorldLighting : MonoBehaviour
     {
         if (refreshOnSceneLoaded)
             SceneManager.sceneLoaded += OnSceneLoaded;
+
+        // Make sure graphics controller knows about this sun.
+        GraphicsSettingsController controller = GraphicsSettingsController.Instance != null
+            ? GraphicsSettingsController.Instance
+            : FindAnyObjectByType<GraphicsSettingsController>();
+        if (controller != null && controller.worldLighting == null)
+            controller.worldLighting = this;
     }
 
     private void OnDisable()

@@ -58,6 +58,19 @@ Also keep `SceneLoadLightingFix` for Menu → Current ambient refresh.
 
 Preset is saved in `PlayerPrefs` (`GraphicsQualityPreset`).
 
+### Auto wiring (no manual hooks needed)
+At runtime, `WorldGraphicsBootstrap` creates and links:
+- `GraphicsSettingsController`
+- `OptimizedWorldLighting`
+- `ShadowLodController`
+- camera as distance origin
+- `ShadowLodOverride` (AlwaysCast) on the Player if tagged/`CharacterController` exists
+
+**Editor (optional, saves into your scene):**
+1. Open `Current`
+2. **GameObject → Graphics → Setup World Lighting & Shadow LOD**
+3. **GameObject → Graphics → Add Quality Dropdown To Canvas** (optional UI)
+
 ---
 
 ## 4. Shadow LOD (distant shadows cheaper)

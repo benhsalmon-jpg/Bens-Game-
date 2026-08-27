@@ -3,7 +3,7 @@ using UnityEngine.UI;
 
 /// <summary>
 /// Optional UI wiring for graphics quality. Drop on a settings panel and assign a Dropdown
-/// with options: Low, Medium, High, Max.
+/// with options: Low, Medium, High, Max. Auto-wires to GraphicsSettingsController.
 /// </summary>
 public class GraphicsSettingsUI : MonoBehaviour
 {
@@ -14,6 +14,9 @@ public class GraphicsSettingsUI : MonoBehaviour
 
     private void Awake()
     {
+        // Prefer the fully wired stack from bootstrap when present.
+        WorldGraphicsBootstrap.EnsureWired(gameObject.scene);
+
         if (controller == null)
             controller = GraphicsSettingsController.Instance != null
                 ? GraphicsSettingsController.Instance
@@ -25,11 +28,28 @@ public class GraphicsSettingsUI : MonoBehaviour
             controller = go.AddComponent<GraphicsSettingsController>();
         }
 
+        if (legacyDropdown == null)
+        {
+            Dropdown[] dropdowns = GetComponentsInChildren<Dropdown>(true);
+            for (int i = 0; i < dropdowns.Length; i++)
+            {
+                if (dropdowns[i] != null &&
+                    dropdowns[i].name.IndexOf("Graphics", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    legacyDropdown = dropdowns[i];
+                    break;
+                }
+            }
+
+            if (legacyDropdown == null && dropdowns.Length == 1)
+                legacyDropdown = dropdowns[0];
+        }
+
         if (legacyDropdown != null)
         {
             legacyDropdown.ClearOptions();
             legacyDropdown.AddOptions(new System.Collections.Generic.List<string> { "Low", "Medium", "High", "Max" });
-            legacyDropdown.value = (int)controller.CurrentPreset;
+            legacyDropdown.SetValueWithoutNotify((int)controller.CurrentPreset);
             legacyDropdown.onValueChanged.RemoveListener(OnDropdownChanged);
             legacyDropdown.onValueChanged.AddListener(OnDropdownChanged);
         }
@@ -69,7 +89,6 @@ public class GraphicsSettingsUI : MonoBehaviour
             legacyDropdown.SetValueWithoutNotify(index);
     }
 
-    // Button hooks if you prefer four buttons instead of a dropdown.
     public void OnClickLow() => controller?.SetLow();
     public void OnClickMedium() => controller?.SetMedium();
     public void OnClickHigh() => controller?.SetHigh();

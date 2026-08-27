@@ -74,14 +74,24 @@ public class ShadowLodController : MonoBehaviour
 
     private void OnEnable()
     {
+        if (graphicsSettings == null)
+            graphicsSettings = GraphicsSettingsController.Instance != null
+                ? GraphicsSettingsController.Instance
+                : FindAnyObjectByType<GraphicsSettingsController>();
+
         if (graphicsSettings != null)
+        {
             graphicsSettings.PresetChanged += OnPresetChanged;
+            if (graphicsSettings.shadowLod == null)
+                graphicsSettings.shadowLod = this;
+        }
 
         if (graphicsSettings != null)
             ApplyFromPreset(graphicsSettings.CurrentPreset);
         else
             ApplyFromPreset(GraphicsQualityPreset.High);
 
+        WorldGraphicsBootstrap.BindDistanceOrigin(this);
         RefreshRegistry(force: true);
     }
 

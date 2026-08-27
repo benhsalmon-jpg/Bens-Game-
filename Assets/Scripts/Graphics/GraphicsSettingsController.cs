@@ -53,8 +53,36 @@ public class GraphicsSettingsController : MonoBehaviour
         else
             CurrentPreset = defaultPreset;
 
+        AutoWireReferences();
+
         if (applyOnAwake)
             ApplyPreset(CurrentPreset, save: false);
+    }
+
+    private void Start()
+    {
+        // Other systems (camera/player/lighting) may spawn in Awake — rebind once more.
+        AutoWireReferences();
+        WorldGraphicsBootstrap.BindDistanceOrigin(shadowLod);
+        WorldGraphicsBootstrap.EnsurePlayerAlwaysCasts();
+        if (shadowLod != null)
+            shadowLod.InvalidateRegistry();
+    }
+
+    private void AutoWireReferences()
+    {
+        if (worldLighting == null)
+            worldLighting = FindAnyObjectByType<OptimizedWorldLighting>();
+
+        if (shadowLod == null)
+        {
+            shadowLod = ShadowLodController.Instance != null
+                ? ShadowLodController.Instance
+                : FindAnyObjectByType<ShadowLodController>();
+        }
+
+        if (shadowLod != null && shadowLod.graphicsSettings == null)
+            shadowLod.graphicsSettings = this;
     }
 
     private void OnDestroy()
